@@ -127,7 +127,18 @@ uint8_t gDPC_ObjDetL1Heap[MMWDEMO_OBJDET_L1RAM_SIZE];
 #define isPong(x) (pingPongId(x))
 
 volatile DSS_DataPathObj*    gMCBobj;
-volatile MmwDemo_output_custom_result*    gMCBresult;
+volatile MmwDemo_output_custom_result*    gMCBresult[2];
+
+// --- 新增的流水线管理变量 ---
+
+// 用于在 Ping(0) 和 Pong(1) 之间切换
+volatile uint8_t g_dpmPingPongId = 0;
+// 标记每个结果缓冲区是否已准备好被发送
+volatile bool g_isResultReady[2] = {false, false};
+// 用于 dpmTask 通知 dataProcessingTask 处理哪个缓冲区
+volatile uint8_t g_processingPingPongId = 0;
+
+// -----------------------------
 
 
 /**************************************************************************
@@ -172,10 +183,16 @@ static void MmwDemo_updateObjectDetStats
     MmwDemo_output_message_stats    *outputMsgStats
 );
 
+//static int32_t MmwDemo_copyResultToHSRAM
+//(
+//    MmwDemo_HSRAM           *ptrHsramBuffer,
+//    DPC_ObjectDetection_ExecuteResult *result,
+//    MmwDemo_output_message_stats *outStats
+//);
 static int32_t MmwDemo_copyResultToHSRAM
 (
     MmwDemo_HSRAM           *ptrHsramBuffer,
-    DPC_ObjectDetection_ExecuteResult *result,
+    MmwDemo_output_custom_result *result,
     MmwDemo_output_message_stats *outStats
 );
 static void MmwDemo_DPC_ObjectDetection_dpmTask(UArg arg0, UArg arg1);
@@ -552,116 +569,166 @@ static void MmwDemo_DPC_ObjectDetection_processInterFrameBeginCallBackFxn(uint8_
  *  @retval
  *      Not Applicable.
  */
-static int32_t MmwDemo_copyResultToHSRAM
-(
-    MmwDemo_HSRAM           *ptrHsramBuffer,
-    DPC_ObjectDetection_ExecuteResult *result,
-    MmwDemo_output_message_stats *outStats
-)
-{
-    uint8_t             *ptrCurrBuffer;
-    uint32_t            totalHsramSize;
-    uint32_t            itemPayloadLen;
+//static int32_t MmwDemo_copyResultToHSRAM
+//(
+//    MmwDemo_HSRAM           *ptrHsramBuffer,
+//    DPC_ObjectDetection_ExecuteResult *result,
+//    MmwDemo_output_message_stats *outStats
+//)
+//{
+//    uint8_t             *ptrCurrBuffer;
+//    uint32_t            totalHsramSize;
+//    uint32_t            itemPayloadLen;
+//
+//    /* Save result in HSRAM */
+//    if(ptrHsramBuffer == NULL)
+//    {
+//        return -1;
+//    }
+//
+//    /* Save result in HSRAM */
+//    if(result != NULL)
+//    {
+//        itemPayloadLen = sizeof(DPC_ObjectDetection_ExecuteResult);
+//        memcpy((void *)&ptrHsramBuffer->result, (void *)result, itemPayloadLen);
+//    }
+//    else
+//    {
+//        return -1;
+//    }
+//
+//    /* Save output Stats in HSRAM */
+//    if(outStats != NULL)
+//    {
+//        itemPayloadLen = sizeof(MmwDemo_output_message_stats);
+//        memcpy((void *)&ptrHsramBuffer->outStats, (void *)outStats, itemPayloadLen);
+//    }
+//
+//    /* Set payload pointer to HSM buffer */
+//    ptrCurrBuffer = &ptrHsramBuffer->payload[0];
+//    totalHsramSize = MMWDEMO_HSRAM_PAYLOAD_SIZE;
+//
+//    /* Save ObjOut in HSRAM */
+//    if(result->objOut != NULL)
+//    {
+//        itemPayloadLen = sizeof(DPIF_PointCloudCartesian) * result->numObjOut;
+//        if((totalHsramSize- itemPayloadLen) > 0)
+//        {
+//            memcpy(ptrCurrBuffer, (void *)result->objOut, itemPayloadLen);
+//
+//            ptrHsramBuffer->result.objOut = (DPIF_PointCloudCartesian *)ptrCurrBuffer;
+//            ptrCurrBuffer+= itemPayloadLen;
+//            totalHsramSize -=itemPayloadLen;
+//        }
+//        else
+//        {
+//            return -1;
+//        }
+//    }
+//
+//    /* Save ObjOutSideInfo in HSRAM */
+//    if(result->objOutSideInfo != NULL)
+//    {
+//        itemPayloadLen = sizeof(DPIF_PointCloudSideInfo) * result->numObjOut;
+//        if((totalHsramSize- itemPayloadLen) > 0)
+//        {
+//            memcpy(ptrCurrBuffer, (void *)result->objOutSideInfo, itemPayloadLen);
+//            ptrHsramBuffer->result.objOutSideInfo = (DPIF_PointCloudSideInfo *)ptrCurrBuffer;
+//            ptrCurrBuffer+= itemPayloadLen;
+//            totalHsramSize -=itemPayloadLen;
+//        }
+//        else
+//        {
+//            return -1;
+//        }
+//    }
+//
+//    /* Save DPC_ObjectDetection_Stats in HSRAM */
+//    if(result->stats != NULL)
+//    {
+//        itemPayloadLen = sizeof(DPC_ObjectDetection_Stats);
+//        if((totalHsramSize- itemPayloadLen) > 0)
+//        {
+//            memcpy(ptrCurrBuffer, (void *)result->stats, itemPayloadLen);
+//            ptrHsramBuffer->result.stats = (DPC_ObjectDetection_Stats *)ptrCurrBuffer;
+//            ptrCurrBuffer+= itemPayloadLen;
+//            totalHsramSize -=itemPayloadLen;
+//        }
+//        else
+//        {
+//            return -1;
+//        }
+//    }
+//
+//    /* Save compRxChanBiasMeasurement in HSRAM */
+//    if(result->compRxChanBiasMeasurement != NULL)
+//    {
+//        itemPayloadLen = sizeof(DPU_AoAProc_compRxChannelBiasCfg);
+//        if((totalHsramSize- itemPayloadLen) > 0)
+//        {
+//            memcpy(ptrCurrBuffer, (void *)result->compRxChanBiasMeasurement, itemPayloadLen);
+//            ptrHsramBuffer->result.compRxChanBiasMeasurement = (DPU_AoAProc_compRxChannelBiasCfg *)ptrCurrBuffer;
+//            ptrCurrBuffer+= itemPayloadLen;
+//            totalHsramSize -=itemPayloadLen;
+//        }
+//        else
+//        {
+//            return -1;
+//        }
+//    }
+//
+//    return totalHsramSize;
+//}
 
-    /* Save result in HSRAM */
-    if(ptrHsramBuffer == NULL)
-    {
-        return -1;
-    }
+ /**
+  * @b Description
+  * @n
+  * Copy DPC custom results and output stats to HSRAM to share with MSS.
+  *
+  * @param[in]  ptrHsramBuffer      Pointer to HSRAM buffer memory
+  * @param[in]  result              Pointer to DPC custom result
+  * @param[in]  outStats            Pointer to Output message stats
+  *
+  * @retval
+  * Success -   0
+  * @retval
+  * Error   -   <0
+  */
+ static int32_t MmwDemo_copyResultToHSRAM
+ (
+     MmwDemo_HSRAM           *ptrHsramBuffer,
+     MmwDemo_output_custom_result *result, // <<< 1. 参数类型已修改
+     MmwDemo_output_message_stats *outStats
+ )
+ {
+     /* 检查输入指针是否有效 */
+     if(ptrHsramBuffer == NULL || result == NULL || outStats == NULL)
+     {
+         return -1;
+     }
 
-    /* Save result in HSRAM */
-    if(result != NULL)
-    {
-        itemPayloadLen = sizeof(DPC_ObjectDetection_ExecuteResult);
-        memcpy((void *)&ptrHsramBuffer->result, (void *)result, itemPayloadLen);
-    }
-    else
-    {
-        return -1;
-    }
+     // 检查 payload 空间是否足够
+     if (sizeof(MmwDemo_output_custom_result) > MMWDEMO_HSRAM_PAYLOAD_SIZE)
+     {
+         // 自定义结构体太大了，无法放入payload
+         System_printf("Error: Custom result size is larger than HSRAM payload size!\n");
+         return -1;
+     }
 
-    /* Save output Stats in HSRAM */
-    if(outStats != NULL)
-    {
-        itemPayloadLen = sizeof(MmwDemo_output_message_stats);
-        memcpy((void *)&ptrHsramBuffer->outStats, (void *)outStats, itemPayloadLen);
-    }
+     /* 1. 将自定义结果结构体完整地拷贝到 payload 的起始位置 */
+     memcpy((void *)&ptrHsramBuffer->payload[0], (void *)result, sizeof(MmwDemo_output_custom_result));
 
-    /* Set payload pointer to HSM buffer */
-    ptrCurrBuffer = &ptrHsramBuffer->payload[0];
-    totalHsramSize = MMWDEMO_HSRAM_PAYLOAD_SIZE;
+     /* 2. 拷贝统计信息到HSRAM的outStats字段  */
+     memcpy((void *)&ptrHsramBuffer->outStats, (void *)outStats, sizeof(MmwDemo_output_message_stats));
 
-    /* Save ObjOut in HSRAM */
-    if(result->objOut != NULL)
-    {
-        itemPayloadLen = sizeof(DPIF_PointCloudCartesian) * result->numObjOut;
-        if((totalHsramSize- itemPayloadLen) > 0)
-        {
-            memcpy(ptrCurrBuffer, (void *)result->objOut, itemPayloadLen);
+     /* 3. (可选但推荐) 将原始的 result 字段清零或设置为一个无效标记 */
+     /* 这可以防止MSS端的代码错误地使用了旧的、无效的数据         */
+     memset((void *)&ptrHsramBuffer->result, 0, sizeof(DPC_ObjectDetection_ExecuteResult));
+     ptrHsramBuffer->result.numObjOut = 0; // 明确表示没有使用这个字段
 
-            ptrHsramBuffer->result.objOut = (DPIF_PointCloudCartesian *)ptrCurrBuffer;
-            ptrCurrBuffer+= itemPayloadLen;
-            totalHsramSize -=itemPayloadLen;
-        }
-        else
-        {
-            return -1;
-        }
-    }
-
-    /* Save ObjOutSideInfo in HSRAM */
-    if(result->objOutSideInfo != NULL)
-    {
-        itemPayloadLen = sizeof(DPIF_PointCloudSideInfo) * result->numObjOut;
-        if((totalHsramSize- itemPayloadLen) > 0)
-        {
-            memcpy(ptrCurrBuffer, (void *)result->objOutSideInfo, itemPayloadLen);
-            ptrHsramBuffer->result.objOutSideInfo = (DPIF_PointCloudSideInfo *)ptrCurrBuffer;
-            ptrCurrBuffer+= itemPayloadLen;
-            totalHsramSize -=itemPayloadLen;
-        }
-        else
-        {
-            return -1;
-        }
-    }
-
-    /* Save DPC_ObjectDetection_Stats in HSRAM */
-    if(result->stats != NULL)
-    {
-        itemPayloadLen = sizeof(DPC_ObjectDetection_Stats);
-        if((totalHsramSize- itemPayloadLen) > 0)
-        {
-            memcpy(ptrCurrBuffer, (void *)result->stats, itemPayloadLen);
-            ptrHsramBuffer->result.stats = (DPC_ObjectDetection_Stats *)ptrCurrBuffer;
-            ptrCurrBuffer+= itemPayloadLen;
-            totalHsramSize -=itemPayloadLen;
-        }
-        else
-        {
-            return -1;
-        }
-    }
-
-    /* Save compRxChanBiasMeasurement in HSRAM */
-    if(result->compRxChanBiasMeasurement != NULL)
-    {
-        itemPayloadLen = sizeof(DPU_AoAProc_compRxChannelBiasCfg);
-        if((totalHsramSize- itemPayloadLen) > 0)
-        {
-            memcpy(ptrCurrBuffer, (void *)result->compRxChanBiasMeasurement, itemPayloadLen);
-            ptrHsramBuffer->result.compRxChanBiasMeasurement = (DPU_AoAProc_compRxChannelBiasCfg *)ptrCurrBuffer;
-            ptrCurrBuffer+= itemPayloadLen;
-            totalHsramSize -=itemPayloadLen;
-        }
-        else
-        {
-            return -1;
-        }
-    }
-
-    return totalHsramSize;
-}
+     /* 成功返回 */
+     return 0;
+ }
 
 uint8_t select_channel(uint8_t subframeIndx,
     uint8_t pingPongId,
@@ -887,32 +954,14 @@ static void MmwDemo_DPC_ObjectDetection_dataProcessingTask(UArg arg0, UArg arg1)
     {
         // 等待新帧信号
         SemaphoreP_pend(Semaphore_FrameStartSem, SemaphoreP_WAIT_FOREVER);
-        // 启动 PING 通道传输
-        EDMA_startDmaTransfer(gMmwDssMCB.dataPathObj.edmaHandle, MRR_SF0_EDMA_CH_1D_IN_PING);
 
-        do {
-            if (EDMA_isTransferComplete(gMmwDssMCB.dataPathObj.edmaHandle,
-                MRR_SF0_EDMA_CH_1D_IN_PING,
-                (bool *)&isTransferDone) != EDMA_NO_ERROR)
-            {
-                MmwDemo_debugAssert(0);
-            }
-        } while (isTransferDone == false);
+        // 获取PINGPONG号
+        uint8_t processingId = g_processingPingPongId;
 
-        process2DFFT(obj);
+        process2DFFT(obj, processingId);
 
-        DPM_Buffer resultBuffer;
-        memset ((void *)&resultBuffer, 0, sizeof(DPM_Buffer));
-        resultBuffer.ptrBuffer[0] = (uint8_t *)gMCBresult; // 指向自定义结果结构
-        resultBuffer.size[0] = sizeof(MmwDemo_output_custom_result);
-        resultBuffer.size[1] = sizeof(MmwDemo_output_message_stats); // 如果统计信息也在这里更新了
-
-        // 发送数据到 MSS
-        retVal = DPM_sendResult(gMmwDssMCB.dataPathObj.objDetDpmHandle, true, &resultBuffer);
-        if (retVal < 0) {
-            System_printf("Error: DataProcessingTask send failed [%d]\n", retVal);
-            MmwDemo_debugAssert(0);
-        }
+        // 【关键】设置标志位，通知 dpmTask "这个缓冲区的结果已经准备好了"
+        g_isResultReady[processingId] = true;
     }
 }
 
@@ -927,7 +976,7 @@ uint16_t log2Snr[NUM_RANGE_BINS];
 uint16_t ind_max_doppler[NUM_RANGE_BINS];
 uint16_t ind_max_val[NUM_RANGE_BINS];
 uint16_t ind_max = 0;
-void process2DFFT(DSS_DataPathObj *obj)
+void process2DFFT(DSS_DataPathObj *obj, uint8_t pingPongId)
 {
     uint32_t rangeIdx;
     uint32_t pingPongIdx = 0;
@@ -1245,44 +1294,60 @@ void MmwDemo_dataPathWait2DInputData(DSS_DataPathObj *obj, uint32_t pingPongId, 
     } while (isTransferDone == false);
 }
 
-volatile uint8_t one_flag = 0;
-static void MmwDemo_DPC_ObjectDetection_dpmTask(UArg arg0, UArg arg1)
-{
-    int32_t     retVal;
-    DPC_ObjectDetection_ExecuteResult *result;
-    volatile uint32_t              startTime;
-
-    while (1)
-    {
-        /* Execute the DPM module: */
-        retVal = DPM_execute (gMmwDssMCB.dataPathObj.objDetDpmHandle, &resultBuffer);
-        if (retVal < 0) {
-            System_printf ("Error: DPM execution failed [Error code %d]\n", retVal);
-            MmwDemo_debugAssert (0);
-        }
-        else
-        {
-            if ((resultBuffer.size[0] == sizeof(DPC_ObjectDetection_ExecuteResult)))
-            {
-                result = (DPC_ObjectDetection_ExecuteResult *)resultBuffer.ptrBuffer[0];
-
-                /* Get the time stamp before copy data to HSRAM */
-                startTime = Cycleprofiler_getTimeStamp();
-
-                /* Update processing stats and added it to buffer 1*/
-                MmwDemo_updateObjectDetStats(result->stats,
-                                                &gMmwDssMCB.dataPathObj.subFrameStats[result->subFrameIdx]);
-
+//volatile uint8_t one_flag = 0;
+//static void MmwDemo_DPC_ObjectDetection_dpmTask(UArg arg0, UArg arg1)
+//{
+//    int32_t     retVal;
+//    DPC_ObjectDetection_ExecuteResult *result_1D;
+//    volatile uint32_t              startTime;
+//
+//    while (1)
+//    {
+//        /* Execute the DPM module: */
+//        retVal = DPM_execute (gMmwDssMCB.dataPathObj.objDetDpmHandle, &resultBuffer);
+//        if (retVal < 0) {
+//            System_printf ("Error: DPM execution failed [Error code %d]\n", retVal);
+//            MmwDemo_debugAssert (0);
+//        }
+//        else
+//        {
+//            if ((resultBuffer.size[0] == sizeof(DPC_ObjectDetection_ExecuteResult)))
+//            {
+//                result = (DPC_ObjectDetection_ExecuteResult *)resultBuffer.ptrBuffer[0];
+//
+//                gMCBresult->subFrameIdx = result->subFrameIdx;
+//
+//                /* Get the time stamp before copy data to HSRAM */
+//                startTime = Cycleprofiler_getTimeStamp();
+//
+//                /* Update processing stats and added it to buffer 1*/
+//                MmwDemo_updateObjectDetStats(result->stats,
+//                                                &gMmwDssMCB.dataPathObj.subFrameStats[result->subFrameIdx]);
+//
+////                if(one_flag == 0)
+////                {
+////                    one_flag = 1;
+////                    DSS_DataPathObj *obj = gMCBobj;
+////                    Remix_DSS_dataPathConfigEdma(obj, result);
+////                }
+//                // 释放信号量，启动 dataProcessingTask 进行2D-FFT
+//                SemaphoreP_post(Semaphore_FrameStartSem);
+//                // 等待 dataProcessingTask 完成计算
+//                SemaphoreP_pend(Semaphore_ResultsReadySem, SemaphoreP_WAIT_FOREVER);
 //                /* Copy result data to HSRAM */
-//                if ((retVal = MmwDemo_copyResultToHSRAM(&gHSRAM, result, &gMmwDssMCB.dataPathObj.subFrameStats[result->subFrameIdx])) >= 0)
+//                if ((retVal = MmwDemo_copyResultToHSRAM(&gHSRAM, gMCBresult, &gMmwDssMCB.dataPathObj.subFrameStats[result->subFrameIdx])) >= 0)
 //                {
 //                    /* Update interframe margin with HSRAM copy time */
 //                    gHSRAM.outStats.interFrameProcessingMargin -= ((Cycleprofiler_getTimeStamp() - startTime)/DSP_CLOCK_MHZ);
 //
-//                    // 数据发送
-//                    resultBuffer.ptrBuffer[0] = (uint8_t *)gMCBresult;  // 指向自定义结果结构
-//                    resultBuffer.size[0] = sizeof(MmwDemo_output_custom_result);
-//                    resultBuffer.size[1] = sizeof(MmwDemo_output_message_stats);
+//                    // 【关键】准备发送给MSS的数据
+//                    // 我们仍然发送一个指向 gHSRAM 描述的缓冲区。
+//                    // MSS 端需要知道，真正的结果在 gHSRAM.payload 中。
+//                    // 为了简单起见，我们继续传递 gHSRAM 的地址，
+//                    // 但发送给MSS的最终UART数据包需要从payload构建。
+//                    resultBuffer.ptrBuffer[0] = (uint8_t *)&gHSRAM;  // 指向自定义结果结构
+//                    resultBuffer.size[0] = sizeof(MmwDemo_HSRAM);
+////                    resultBuffer.size[1] = sizeof(MmwDemo_output_message_stats);
 //                    retVal = DPM_sendResult(gMmwDssMCB.dataPathObj.objDetDpmHandle, true, &resultBuffer);
 //                    if (retVal < 0) {
 //                        System_printf("Error: DataProcessingTask send failed [%d]\n", retVal);
@@ -1293,20 +1358,102 @@ static void MmwDemo_DPC_ObjectDetection_dpmTask(UArg arg0, UArg arg1)
 //                    System_printf ("Error: Failed to copy processing results to HSRAM, error=%d\n", retVal);
 //                    MmwDemo_debugAssert (0);
 //                }
+//            }
+//        }
+//    }
+//}
 
-                // 开始另一个线程操作
-                if(one_flag == 0)
-                {
-                    one_flag = 1;
-                    DSS_DataPathObj *obj = gMCBobj;
-                    Remix_DSS_dataPathConfigEdma(obj, result);
-                }
-                if(g_frame_cnt >= 1)
-                {
-                    // 第二帧开始
-                    SemaphoreP_post(Semaphore_FrameStartSem);
+/**
+ * @b Description
+ * @n
+ * DPM Task. This is the main thread of the true pipeline.
+ * It checks for and sends previously computed results, waits for new 1D-FFT
+ * data, copies it to the next available buffer, and then dispatches the
+ * processing task.
+ */
+static void MmwDemo_DPC_ObjectDetection_dpmTask(UArg arg0, UArg arg1)
+{
+    int32_t     retVal;
+    DPC_ObjectDetection_ExecuteResult *result_1D; // 重命名以示区分
+
+    while (1)
+    {
+        // --- 1. 检查【上一个】缓冲区的结果是否已经计算完毕 ---
+        uint8_t prevPingPongId = g_dpmPingPongId ^ 1;
+        if (g_isResultReady[prevPingPongId] == true)
+        {
+            volatile uint32_t startTime = Cycleprofiler_getTimeStamp();
+
+            // 从对应的存储区获取最终结果
+            MmwDemo_output_custom_result* finalResult = gMCBresult[prevPingPongId];
+
+            // 将最终结果拷贝到HSRAM以供MSS访问
+            if ((retVal = MmwDemo_copyResultToHSRAM(&gHSRAM, finalResult, &gMmwDssMCB.dataPathObj.subFrameStats[finalResult->subFrameIdx])) >= 0)
+            {
+                gHSRAM.outStats.interFrameProcessingMargin -= ((Cycleprofiler_getTimeStamp() - startTime)/DSP_CLOCK_MHZ);
+
+                // 准备缓冲区并发送给MSS
+                resultBuffer.ptrBuffer[0] = (uint8_t *)&gHSRAM;
+                resultBuffer.size[0]      = sizeof(MmwDemo_HSRAM);
+
+                retVal = DPM_sendResult(gMmwDssMCB.dataPathObj.objDetDpmHandle, true, &resultBuffer);
+                if (retVal < 0) {
+                    System_printf("Error: DPM_sendResult failed [%d]\n", retVal);
                 }
             }
+            else
+            {
+                 System_printf ("Error: Failed to copy results to HSRAM, error=%d\n", retVal);
+                 MmwDemo_debugAssert (0);
+            }
+
+            // 清除标志位，表示结果已发送
+            g_isResultReady[prevPingPongId] = false;
+        }
+
+
+        // --- 2. 阻塞等待DPM框架完成硬件操作和1D-FFT ---
+        retVal = DPM_execute (gMmwDssMCB.dataPathObj.objDetDpmHandle, &resultBuffer);
+
+        if (retVal == DPM_SOK)
+        {
+            if ((resultBuffer.size[0] == sizeof(DPC_ObjectDetection_ExecuteResult)))
+            {
+                result_1D = (DPC_ObjectDetection_ExecuteResult *)resultBuffer.ptrBuffer[0];
+
+                // 更新统计信息
+                MmwDemo_updateObjectDetStats(result_1D->stats, &gMmwDssMCB.dataPathObj.subFrameStats[result_1D->subFrameIdx]);
+
+                // --- 3. 将1D-FFT结果通过EDMA拷贝到【当前】Ping-Pong缓冲区 ---
+                uint8_t chId_CubeCopy = MRR_SF0_EDMA_CH_1D_IN_PING;
+                // 更新EDMA的源和目标地址
+                EDMA_setSourceAddress(gMmwDssMCB.dataPathObj.edmaHandle, chId_CubeCopy, (uint32_t)result_1D->radarCube.data);
+                EDMA_setDestinationAddress(gMmwDssMCB.dataPathObj.edmaHandle, chId_CubeCopy, (uint32_t)gMCBobj->radarCubePrev[g_dpmPingPongId]);
+                // 触发EDMA传输
+                EDMA_startDmaTransfer(gMmwDssMCB.dataPathObj.edmaHandle, chId_CubeCopy);
+
+                // 等待拷贝完成
+                volatile bool isTransferDone;
+                do {
+                   if (EDMA_isTransferComplete(gMmwDssMCB.dataPathObj.edmaHandle, chId_CubeCopy, (bool *)&isTransferDone) != EDMA_NO_ERROR)
+                   { MmwDemo_debugAssert(0); }
+                } while (isTransferDone == false);
+
+                // 拷贝完成后，对目标内存区域进行缓存无效化
+                Cache_inv(gMCBobj->radarCubePrev[g_dpmPingPongId], result_1D->radarCube.dataSize, Cache_Type_ALLD, true);
+
+                // --- 4. 通知 dataProcessingTask 开始处理这个缓冲区 ---
+                g_processingPingPongId = g_dpmPingPongId;
+                SemaphoreP_post(Semaphore_FrameStartSem);
+
+                // --- 5. 切换到下一个Ping-Pong缓冲区，为下一帧做准备 ---
+                g_dpmPingPongId = g_dpmPingPongId ^ 1;
+            }
+        }
+        else if (retVal < 0 && retVal != DPM_ENOEXEC)
+        {
+             System_printf ("Error: DPM execution failed [Error code %d]\n", retVal);
+             MmwDemo_debugAssert (0);
         }
     }
 }
@@ -1321,6 +1468,7 @@ static void MmwDemo_DPC_ObjectDetection_dpmTask(UArg arg0, UArg arg1)
  *      Not Applicable.
  */
 Semaphore_Handle Semaphore_FrameStartSem;
+Semaphore_Handle Semaphore_ResultsReadySem;
 Semaphore_Params semParams;
 //Semaphore_Struct structSem;
 static void MmwDemo_dssInitTask(UArg arg0, UArg arg1)
@@ -1418,6 +1566,7 @@ static void MmwDemo_dssInitTask(UArg arg0, UArg arg1)
     // 构建帧接收的信号量
     Semaphore_Params_init(&semParams);
     Semaphore_FrameStartSem = Semaphore_create(0, &semParams, NULL);
+    Semaphore_ResultsReadySem = Semaphore_create(0, &semParams, NULL);
 
     //
     /* Launch the DPM Task */
@@ -1469,9 +1618,11 @@ int main (void)
     /* Initialize and populate the demo MCB */
     memset ((void*)&gMmwDssMCB, 0, sizeof(MmwDemo_DSS_MCB));
 
-    static MmwDemo_output_custom_result custom_result;
-    memset ((void*)gMCBresult, 0, sizeof(MmwDemo_output_custom_result));
-    gMCBresult = &custom_result;
+    static MmwDemo_output_custom_result custom_result, custom_result_1;
+    memset(&custom_result, 0, sizeof(MmwDemo_output_custom_result));
+    memset(&custom_result_1, 0, sizeof(MmwDemo_output_custom_result));
+    gMCBresult[0] = &custom_result;
+    gMCBresult[1] = &custom_result_1;
 
     /* Initialize the SOC confiugration: */
     memset ((void *)&socCfg, 0, sizeof(SOC_Cfg));

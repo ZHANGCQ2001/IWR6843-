@@ -1829,14 +1829,21 @@ static int32_t DPC_ObjDetDSP_preStartConfig
 
     /* L3 - radar cube prev */
 
-    obj.radarCubePrev = DPC_ObjDetDSP_MemPoolAlloc(L3ramObj, radarCube.dataSize,
+    obj.radarCubePrev[0] = DPC_ObjDetDSP_MemPoolAlloc(L3ramObj, radarCube.dataSize,
                                              DPC_OBJDET_RADAR_CUBE_DATABUF_BYTE_ALIGNMENT);
-    if (obj.radarCubePrev == NULL)
+    if (obj.radarCubePrev[0] == NULL)
     {
         retVal = DPC_OBJECTDETECTION_ENOMEM__L3_RAM_RADAR_CUBE;
         goto exit;
     }
 
+    obj.radarCubePrev[1] = DPC_ObjDetDSP_MemPoolAlloc(L3ramObj, radarCube.dataSize,
+                                             DPC_OBJDET_RADAR_CUBE_DATABUF_BYTE_ALIGNMENT);
+    if (obj.radarCubePrev[1] == NULL)
+    {
+        retVal = DPC_OBJECTDETECTION_ENOMEM__L3_RAM_RADAR_CUBE;
+        goto exit;
+    }
     /* L3 - detection matrix */
     detMatrix.dataSize = staticCfg->numRangeBins * staticCfg->numDopplerBins * sizeof(uint16_t);
     System_printf("  L3 currAddr    = 0x%x\n", (uint32_t)L3ramObj->currAddr);
@@ -2023,10 +2030,127 @@ static int32_t DPC_ObjDetDSP_preStartConfig
 //        goto exit;
 //    }
 
+
+    //====================> EDMA 配置代码 <=======================
+    uint8_t chId = MRR_SF0_EDMA_CH_1D_IN_PING;
+    uint16_t shadowParam = EDMA_NUM_DMA_CHANNELS + 20;
+    uint32_t eventQueue = 0U;
+    int32_t err;
+    uint16_t sampleLenInBytes = sizeof(cmplx16ImRe_t);
+
+    // --- 使用 EDMAutil_configType3 进行直接的2D内存拷贝 ---
+
+    // 我们将整个 radarCube 视为一个 2D 矩形
+    // A-Count: 每一行有多宽 (e.g., 一个多普勒chirp的数据)
+    // B-Count: 总共有多少行 (e.g., 总共有多少个多普勒chirp)
+    uint16_t aCount = staticCfg->numRangeBins * staticCfg->ADCBufData.dataProperty.numRxAntennas * sizeof(cmplx16ImRe_t);
+    uint16_t bCount = staticCfg->numDopplerChirps * staticCfg->numTxAntennas;
+
+    // 检查总大小是否匹配
+    if ((aCount * bCount) != radarCube.dataSize)
+    {
+        System_printf("Error: EDMA transfer size calculation mismatch!\n");
+        MmwDemo_debugAssert(0);
+    }
+
+    err = EDMAutil_configType3(
+        gMmwDssMCB.dataPathObj.edmaHandle,
+        (uint8_t *)radarCube.data,   // 源地址
+        (uint8_t *)obj.radarCubePrev, // 目标地址
+        chId,
+        true,                        // 事件触发 (由软件手动触发)
+        shadowParam++,
+        aCount,                      // 每次传输的字节数 (一行)
+        bCount,                      // 总共传输的次数 (行数)
+        aCount,                      // 源地址的行间距 (B-index)
+        aCount,                      // 目标地址的行间距 (B-index)
+        0,                           // Event Queue ID
+        NULL,                        // 无回调函数
+        NULL
+    );
+
+    if (err != EDMA_NO_ERROR)
+    {
+        System_printf(">> EDMA config (Type3) for radarCube copy failed, error = %d\n", err);
+        return err; // 使用 retVal = err; goto exit; 会更好
+    }
+    eventQueue = 1;
+
+    DPEDMA_syncABCfg    syncABCfg;
+    cmplx16ImRe_t      *radarCubeBase;
+    radarCubeBase = (cmplx16ImRe_t *)obj.radarCubePrev;
+
+    /******************************************************************************************
+    *  PROGRAM DMA channel  to transfer data from Radar cube to input buffer (ping)
+    ******************************************************************************************/
+    syncABCfg.srcAddress  = (uint32_t)(&radarCubeBase[0]);
+    syncABCfg.destAddress = (uint32_t)(&obj.dstPingPong[0]);
+    syncABCfg.aCount      = sampleLenInBytes;
+    syncABCfg.bCount      = staticCfg->numDopplerBins;
+    syncABCfg.cCount      = 1;/*data for one virtual antenna transferred at a time*/
+    syncABCfg.srcBIdx     = SYS_NUM_RX_CHANNEL * staticCfg->numRangeBins * sampleLenInBytes;
+    syncABCfg.dstBIdx     = sampleLenInBytes;
+    syncABCfg.srcCIdx     = 0U;
+    syncABCfg.dstCIdx     = 0U;
+
+    DPEDMA_ChanCfg chancfg;
+    chancfg.channel = MRR_SF0_EDMA_CH_3D_IN_PING;
+    chancfg.channelShadow = shadowParam++;
+    chancfg.eventQueue = 1;
+    err = DPEDMA_configSyncAB(gMmwDssMCB.dataPathObj.edmaHandle,
+                                 &chancfg,
+                                 NULL,//chainingCfg: No chaining
+                                 &syncABCfg,
+                                 false,//isEventTriggered
+                                 true, //isIntermediateTransferCompletionEnabled
+                                 true,//isTransferCompletionEnabled
+                                 NULL, //transferCompletionCallbackFxn
+                                 NULL);//transferCompletionCallbackFxnArg
+
+    if (err != EDMA_NO_ERROR)
+    {
+        System_printf(">> EDMAutil_configType1b 配置失败，错误码 = %d\n", err);
+        return err;
+    }
+
+    /******************************************************************************************
+    *  PROGRAM DMA channel  to transfer data from Radar cube to input buffer (pong)
+     ******************************************************************************************/
+
+    /* Transfer parameters are the same as ping, except for src/dst addresses */
+
+    /*Ping/Pong srcAddress is reprogrammed in every iteration (except for first ping), therefore
+      this srcAddress below will be reprogrammed during processing. In order to avoid recomputing here
+      the first pong srcAddress, it will be hardcoded to a valid address (dummy).*/
+    syncABCfg.srcAddress  = (uint32_t)(&radarCubeBase[0]);/*dummy*/
+    syncABCfg.destAddress = (uint32_t)(&obj.dstPingPong[staticCfg->numDopplerBins]);
+    chancfg.channel = MRR_SF0_EDMA_CH_3D_IN_PONG;
+    chancfg.channelShadow = shadowParam++;
+    err = DPEDMA_configSyncAB(gMmwDssMCB.dataPathObj.edmaHandle,
+                                 &chancfg,
+                                 NULL,//chainingCfg: No chaining
+                                 &syncABCfg,
+                                 false,//isEventTriggered
+                                 true, //isIntermediateTransferCompletionEnabled
+                                 true,//isTransferCompletionEnabled
+                                 NULL, //transferCompletionCallbackFxn
+                                 NULL);//transferCompletionCallbackFxnArg
+
+    if (err != EDMA_NO_ERROR)
+    {
+        System_printf(">> EDMAutil_configType1b 配置失败，错误码 = %d\n", err);
+        return err;
+    }
+
+    // ====================> EDMA配置代码结束 <====================
+
+
     /* Report RAM usage */
     *CoreL2RamUsage = DPC_ObjDetDSP_MemPoolGetMaxUsage(CoreL2RamObj);
     *CoreL1RamUsage = DPC_ObjDetDSP_MemPoolGetMaxUsage(CoreL1RamObj);
     *L3RamUsage = DPC_ObjDetDSP_MemPoolGetMaxUsage(L3ramObj);
+
+    System_printf("分配内存、配置EDMA成功");
 
 exit:
     return retVal;
