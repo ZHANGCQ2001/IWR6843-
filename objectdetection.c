@@ -1789,7 +1789,10 @@ static int32_t DPC_ObjDetDSP_preStartConfig
     /* Derived config */
     subFrameObj->log2NumDopplerBins = mathUtils_floorLog2(staticCfg->numDopplerBins);
 
-    DPC_ObjDetDSP_MemPoolReset(L3ramObj);
+    /* 【移除】所有 DPC_ObjDetDSP_MemPoolAlloc(L3ramObj, ...) 的调用，
+     * 特别是为 radarCube.data 和 obj.radarCubePrev[0]/[1] 分配内存的代码。
+     */
+//    DPC_ObjDetDSP_MemPoolReset(L3ramObj);
     DPC_ObjDetDSP_MemPoolReset(CoreL2RamObj);
     DPC_ObjDetDSP_MemPoolReset(CoreL1RamObj);
 
@@ -1797,53 +1800,23 @@ static int32_t DPC_ObjDetDSP_preStartConfig
     /* L3 - radar cube */
     radarCube.dataSize = staticCfg->numRangeBins * staticCfg->numDopplerChirps *
                          staticCfg->numVirtualAntennas * sizeof(cmplx16ImRe_t);
-    if(preStartCfg->shareMemCfg.shareMemEnable == true)
-    {
-        if((preStartCfg->shareMemCfg.radarCubeMem.addr != NULL) &&
-          (preStartCfg->shareMemCfg.radarCubeMem.size == radarCube.dataSize))
-        {
-            /* Use assigned radar cube address */
-            radarCube.data = preStartCfg->shareMemCfg.radarCubeMem.addr;
-        }
-        else
-        {
-            retVal = DPC_OBJECTDETECTION_EINVAL__COMMAND;
-            goto exit;
-        }
-    }
-    else
-    {
-        /* Allocate from memory */
-        radarCube.data = DPC_ObjDetDSP_MemPoolAlloc(L3ramObj, radarCube.dataSize,
-                                                 DPC_OBJDET_RADAR_CUBE_DATABUF_BYTE_ALIGNMENT);
-
-        if (radarCube.data == NULL)
-        {
-            retVal = DPC_OBJECTDETECTION_ENOMEM__L3_RAM_RADAR_CUBE;
-            goto exit;
-        }
-    }
-
-    /* Only supported radar Cube format in this DPC */
-    radarCube.datafmt = DPIF_RADARCUBE_FORMAT_1;
 
     /* L3 - radar cube prev */
 
-    obj.radarCubePrev[0] = DPC_ObjDetDSP_MemPoolAlloc(L3ramObj, radarCube.dataSize,
-                                             DPC_OBJDET_RADAR_CUBE_DATABUF_BYTE_ALIGNMENT);
+    obj.radarCubePrev[0] = subFrameObj->radarCubePingIn.data;
     if (obj.radarCubePrev[0] == NULL)
     {
         retVal = DPC_OBJECTDETECTION_ENOMEM__L3_RAM_RADAR_CUBE;
         goto exit;
     }
 
-    obj.radarCubePrev[1] = DPC_ObjDetDSP_MemPoolAlloc(L3ramObj, radarCube.dataSize,
-                                             DPC_OBJDET_RADAR_CUBE_DATABUF_BYTE_ALIGNMENT);
+    obj.radarCubePrev[1] = subFrameObj->radarCubePongIn.data;
     if (obj.radarCubePrev[1] == NULL)
     {
         retVal = DPC_OBJECTDETECTION_ENOMEM__L3_RAM_RADAR_CUBE;
         goto exit;
     }
+
     /* L3 - detection matrix */
     detMatrix.dataSize = staticCfg->numRangeBins * staticCfg->numDopplerBins * sizeof(uint16_t);
     System_printf("  L3 currAddr    = 0x%x\n", (uint32_t)L3ramObj->currAddr);
@@ -1907,13 +1880,6 @@ static int32_t DPC_ObjDetDSP_preStartConfig
                                               DPU_DOPPLERPROCDSP_BUFFER_BYTE_ALIGNMENT);
     DebugP_assert(dftSinCosTable != NULL);
 
-//    /* AoA DPU Twiddle buffer */
-//    angleTwiddle32x32Size = sizeof(cmplx32ReIm_t) * DPU_AOAPROCDSP_NUM_ANGLE_BINS;
-//    angleTwiddle32x32 = (cmplx32ReIm_t *)DPC_ObjDetDSP_MemPoolAlloc(CoreL1RamObj,
-//                                          angleTwiddle32x32Size,
-//                                          DPU_AOAPROCDSP_BUFFERS_BYTE_ALIGNMENT);
-//    DebugP_assert(angleTwiddle32x32 != NULL);
-
     uint32_t window2DSize = sizeof(int32_t) * staticCfg->numDopplerBins / 2;
     obj.window2D = (int32_t *)DPC_ObjDetDSP_MemPoolAlloc(CoreL2RamObj,
                                           window2DSize,
@@ -1973,30 +1939,20 @@ static int32_t DPC_ObjDetDSP_preStartConfig
     DPC_ObjDetDSP_MemPoolSet(CoreL2RamObj, CoreL2ScratchStartPoolAddr);
     DPC_ObjDetDSP_MemPoolSet(CoreL1RamObj, CoreL1ScratchStartPoolAddr);
 
-//    DebugP_assert(edmaHandle[DPC_OBJDET_DPU_CFARCA_PROC_EDMA_INST_ID] != NULL);
-//    retVal = DPC_ObjDetDSP_CFARCAconfig(subFrameObj->dpuCFARCAObj,
-//                 subFrameObj,
-//                 edmaHandle[DPC_OBJDET_DPU_CFARCA_PROC_EDMA_INST_ID],
-//                 &detMatrix,
-//                 cfarRngDopSnrList,
-//                 cfarRngDopSnrListSize,
-//                 CoreL2RamObj,
-//                 CoreL1RamObj,
-//                 commonCfg->compRxChanCfg.rangeBias,
-//                 &subFrameObj->dpuCfg.cfarCfg);
-//    if (retVal != 0)
-//    {
-//        goto exit;
-//    }
-
     /* Rewind to the scratch beginning */
     DPC_ObjDetDSP_MemPoolSet(CoreL2RamObj, CoreL2ScratchStartPoolAddr);
     DPC_ObjDetDSP_MemPoolSet(CoreL1RamObj, CoreL1ScratchStartPoolAddr);
 
+    //在配置 Doppler DPU 时，radarCube 参数需要调整
+    DPIF_RadarCube dpuRadarCube;
+    dpuRadarCube.data = obj.radarCubePrev[0]; // 默认指向第一个
+    dpuRadarCube.dataSize = radarCube.dataSize;
+    dpuRadarCube.datafmt = DPIF_RADARCUBE_FORMAT_1;
+
     retVal = DPC_ObjDetDSP_dopplerConfig(subFrameObj->dpuDopplerObj, &subFrameObj->staticCfg,
                  subFrameObj->log2NumDopplerBins, &subFrameObj->dynCfg,
                  edmaHandle[DPC_OBJDET_DPU_DOPPLERPROC_EDMA_INST_ID],
-                 &radarCube, &detMatrix, 
+                 &dpuRadarCube, &detMatrix,
                  CoreL2RamObj,
                  CoreL1RamObj,
                  dopplerWindow, dopplerWindowSize,
@@ -2007,29 +1963,9 @@ static int32_t DPC_ObjDetDSP_preStartConfig
     {
         goto exit;
     }
-
     /* Rewind to the scratch beginning */
     DPC_ObjDetDSP_MemPoolSet(CoreL2RamObj, CoreL2ScratchStartPoolAddr);
     DPC_ObjDetDSP_MemPoolSet(CoreL1RamObj, CoreL1ScratchStartPoolAddr);
-
-//    DebugP_assert(edmaHandle[DPC_OBJDET_DPU_AOA_PROC_EDMA_INST_ID] != NULL);
-//    retVal = DPC_ObjDetDSP_AoAconfig(subFrameObj->dpuAoAObj, &commonCfg->compRxChanCfg,
-//                 &subFrameObj->staticCfg, &subFrameObj->dynCfg,
-//                 edmaHandle[DPC_OBJDET_DPU_AOA_PROC_EDMA_INST_ID],
-//                 &radarCube,
-//                 cfarRngDopSnrList, cfarRngDopSnrListSize,
-//                 CoreL1RamObj,
-//                 CoreL2RamObj,
-//                 L3ramObj,
-//                 dopplerWindow, dopplerWindowSize,
-//                 dopplerTwiddle, dopplerTwiddleSize,
-//                 angleTwiddle32x32, angleTwiddle32x32Size,
-//                 &subFrameObj->dpuCfg.aoaCfg);
-//    if (retVal != 0)
-//    {
-//        goto exit;
-//    }
-
 
     //====================> EDMA 配置代码 <=======================
     uint8_t chId = MRR_SF0_EDMA_CH_1D_IN_PING;
@@ -2038,55 +1974,19 @@ static int32_t DPC_ObjDetDSP_preStartConfig
     int32_t err;
     uint16_t sampleLenInBytes = sizeof(cmplx16ImRe_t);
 
-    // --- 使用 EDMAutil_configType3 进行直接的2D内存拷贝 ---
-
-    // 我们将整个 radarCube 视为一个 2D 矩形
-    // A-Count: 每一行有多宽 (e.g., 一个多普勒chirp的数据)
-    // B-Count: 总共有多少行 (e.g., 总共有多少个多普勒chirp)
-    uint16_t aCount = staticCfg->numRangeBins * staticCfg->ADCBufData.dataProperty.numRxAntennas * sizeof(cmplx16ImRe_t);
-    uint16_t bCount = staticCfg->numDopplerChirps * staticCfg->numTxAntennas;
-
-    // 检查总大小是否匹配
-    if ((aCount * bCount) != radarCube.dataSize)
-    {
-        System_printf("Error: EDMA transfer size calculation mismatch!\n");
-        MmwDemo_debugAssert(0);
-    }
-
-    err = EDMAutil_configType3(
-        gMmwDssMCB.dataPathObj.edmaHandle,
-        (uint8_t *)radarCube.data,   // 源地址
-        (uint8_t *)obj.radarCubePrev, // 目标地址
-        chId,
-        true,                        // 事件触发 (由软件手动触发)
-        shadowParam++,
-        aCount,                      // 每次传输的字节数 (一行)
-        bCount,                      // 总共传输的次数 (行数)
-        aCount,                      // 源地址的行间距 (B-index)
-        aCount,                      // 目标地址的行间距 (B-index)
-        0,                           // Event Queue ID
-        NULL,                        // 无回调函数
-        NULL
-    );
-
-    if (err != EDMA_NO_ERROR)
-    {
-        System_printf(">> EDMA config (Type3) for radarCube copy failed, error = %d\n", err);
-        return err; // 使用 retVal = err; goto exit; 会更好
-    }
     eventQueue = 1;
 
     DPEDMA_syncABCfg    syncABCfg;
     cmplx16ImRe_t      *radarCubeBase;
-    radarCubeBase = (cmplx16ImRe_t *)obj.radarCubePrev;
+    radarCubeBase = (cmplx16ImRe_t *)obj.radarCubePrev[0];
 
     /******************************************************************************************
     *  PROGRAM DMA channel  to transfer data from Radar cube to input buffer (ping)
     ******************************************************************************************/
-    syncABCfg.srcAddress  = (uint32_t)(&radarCubeBase[0]);
+    syncABCfg.srcAddress  = (uint32_t)(radarCubeBase);
     syncABCfg.destAddress = (uint32_t)(&obj.dstPingPong[0]);
     syncABCfg.aCount      = sampleLenInBytes;
-    syncABCfg.bCount      = staticCfg->numDopplerBins;
+    syncABCfg.bCount      = staticCfg->numDopplerChirps;
     syncABCfg.cCount      = 1;/*data for one virtual antenna transferred at a time*/
     syncABCfg.srcBIdx     = SYS_NUM_RX_CHANNEL * staticCfg->numRangeBins * sampleLenInBytes;
     syncABCfg.dstBIdx     = sampleLenInBytes;
@@ -2122,8 +2022,9 @@ static int32_t DPC_ObjDetDSP_preStartConfig
     /*Ping/Pong srcAddress is reprogrammed in every iteration (except for first ping), therefore
       this srcAddress below will be reprogrammed during processing. In order to avoid recomputing here
       the first pong srcAddress, it will be hardcoded to a valid address (dummy).*/
-    syncABCfg.srcAddress  = (uint32_t)(&radarCubeBase[0]);/*dummy*/
-    syncABCfg.destAddress = (uint32_t)(&obj.dstPingPong[staticCfg->numDopplerBins]);
+    radarCubeBase = (cmplx16ImRe_t *)obj.radarCubePrev[1];
+    syncABCfg.srcAddress  = (uint32_t)(radarCubeBase);/*dummy*/
+    syncABCfg.destAddress = (uint32_t)(&obj.dstPingPong[staticCfg->numDopplerChirps]);
     chancfg.channel = MRR_SF0_EDMA_CH_3D_IN_PONG;
     chancfg.channelShadow = shadowParam++;
     err = DPEDMA_configSyncAB(gMmwDssMCB.dataPathObj.edmaHandle,
@@ -2873,6 +2774,18 @@ static int32_t DPC_ObjectDetection_ioctl
                 memUsage->SystemHeapDPCUsed = statsStart.totalFreeSize - statsEnd.totalFreeSize;
 
                 DebugP_log1("ObjDet DPC: Pre-start Config IOCTL processed (subFrameIndx = %d)\n", subFrameNum);
+                break;
+            }
+
+            // 【新增】处理来自MSS的输入缓冲区配置命令
+            case MMWDEMO_DPC_OBJDET_IOCTL__SET_INPUT_BUFFERS:
+            {
+                DPC_ObjectDetection_setInBufCfg* cfg = (DPC_ObjectDetection_setInBufCfg*)arg;
+                subFrmObj = &objDetObj->subFrameObj[cfg->subFrameNum];
+
+                subFrmObj->radarCubePingIn = cfg->radarCube[0];
+                subFrmObj->radarCubePongIn = cfg->radarCube[1];
+
                 break;
             }
 

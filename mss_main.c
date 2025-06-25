@@ -1765,328 +1765,109 @@ static uint16_t MmwDemo_convertCfarToLinear(uint16_t codedCfarVal, uint8_t numVi
  *  @retval
  *      Error       - <0
  */
-static int32_t MmwDemo_dataPathConfig (void)
+#include <ti/datapath/dpc/objectdetection/objdetrangehwa/include/objdetrangehwainternal.h>
+int32_t DPC_ObjectDetection_execute
+(
+    DPM_DPCHandle   handle,
+    DPM_Buffer* ptrResult
+)
 {
-    int32_t                         errCode;
-    MMWave_CtrlCfg                  *ptrCtrlCfg;
-    MmwDemo_DPC_ObjDet_CommonCfg *objDetCommonCfg;
-    MmwDemo_SubFrameCfg             *subFrameCfg;
-    int8_t                          subFrameIndx;
-    MmwDemo_RFParserOutParams       RFparserOutParams;
-    DPC_ObjectDetectionRangeHWA_PreStartCfg objDetPreStartR4fCfg;
-    DPC_ObjectDetectionRangeHWA_StaticCfg *staticCfg;
-    DPC_ObjectDetection_PreStartCfg objDetPreStartDspCfg;
-    DPC_ObjectDetectionRangeHWA_PreStartCommonCfg preStartCommonCfg;
+    ObjDetObj     *objDetObj = (ObjDetObj *) handle;
+    SubFrameObj   *subFrmObj;
+    DPU_RangeProcHWA_OutParams outRangeProc;
+    int32_t       retVal;
+    DPM_Buffer    rangeProcResult;
 
-    /* Get data path object and control configuration */
-    ptrCtrlCfg = &gMmwMssMCB.cfg.ctrlCfg;
+    DebugP_assert (objDetObj != NULL);
+    DebugP_assert (ptrResult != NULL);
 
-    objDetCommonCfg = &gMmwMssMCB.objDetCommonCfg;
-    staticCfg = &objDetPreStartR4fCfg.staticCfg;
+    /* 获取当前子帧的对象 */
+    subFrmObj = &objDetObj->subFrameObj[objDetObj->subFrameIndx];
 
-    /* Get RF frequency scale factor */
-    gMmwMssMCB.rfFreqScaleFactor = SOC_getDeviceRFFreqScaleFactor(gMmwMssMCB.socHandle, &errCode);
-    if (errCode < 0)
+    DebugP_log1("ObjDet DPC: Processing sub-frame %d\n", objDetObj->subFrameIndx);
+
+    /* 调用帧开始回调函数 (如果已注册) */
+    if (objDetObj->processCallBackFxn.processFrameBeginCallBackFxn != NULL)
     {
-        System_printf ("Error: Unable to get RF scale factor [Error:%d]\n", errCode);
-        MmwDemo_debugAssert(0);
+        (*objDetObj->processCallBackFxn.processFrameBeginCallBackFxn)(objDetObj->subFrameIndx);
     }
 
-    gMmwMssMCB.objDetCommonCfg.preStartCommonCfg.numSubFrames =
-        MmwDemo_RFParser_getNumSubFrames(ptrCtrlCfg);
+    // ==================> 【架构优化 - 最终逻辑】 <==================
 
-    DebugP_log0("App: Issuing Pre-start Common Config IOCTL to R4F\n");
-
-    /* DPC pre-start common config */
-    preStartCommonCfg.numSubFrames = gMmwMssMCB.objDetCommonCfg.preStartCommonCfg.numSubFrames;
-    errCode = DPM_ioctl (gMmwMssMCB.objDetDpmHandle,
-                         DPC_OBJDETRANGEHWA_IOCTL__STATIC_PRE_START_COMMON_CFG,
-                         &preStartCommonCfg,
-                         sizeof (preStartCommonCfg));
-    if (errCode < 0)
+    /* 1. 如果配置了自定义缓冲区，则在处理前进行重配置 */
+    if (subFrmObj->isCustomBufCfg)
     {
-        System_printf ("Error: Unable to send DPC_OBJDETRANGEHWA_IOCTL__STATIC_PRE_START_COMMON_CFG [Error:%d]\n", errCode);
-        goto exit;
-    }
-    DebugP_log0("App: Issuing Pre-start Common Config IOCTL to DSP\n");
+        // 更新配置结构中的输出缓冲区地址，指向当前的Ping或Pong
+        subFrmObj->rangeCfg.hwRes.radarCube = subFrmObj->dssPingPongBuf[subFrmObj->pingPongId];
 
-    /* DPC pre-start common config */
-    errCode = MmwDemo_DPM_ioctl_blocking (gMmwMssMCB.objDetDpmHandle,
-                         DPC_OBJDET_IOCTL__STATIC_PRE_START_COMMON_CFG,
-                         &objDetCommonCfg->preStartCommonCfg,
-                         sizeof (DPC_ObjectDetection_PreStartCommonCfg));
-
-    if (errCode < 0)
-    {
-        System_printf ("Error: Unable to send DPC_OBJDET_IOCTL__STATIC_PRE_START_COMMON_CFG [Error:%d]\n", errCode);
-        goto exit;
-    }
-
-    MmwDemo_resetDynObjDetCommonCfgPendingState(&gMmwMssMCB.objDetCommonCfg);
-
-    /* Reason for reverse loop is that when sensor is started, the first sub-frame
-     * will be active and the ADC configuration needs to be done for that sub-frame
-     * before starting (ADC buf hardware does not have notion of sub-frame, it will
-     * be reconfigured every sub-frame). This cannot be alternatively done by calling
-     * the MmwDemo_ADCBufConfig function only for the first sub-frame because this is
-     * a utility API that computes the rxChanOffset that is part of ADC dataProperty
-     * which will be used by range DPU and therefore this computation is required for
-     * all sub-frames.
-     */
-    for(subFrameIndx = gMmwMssMCB.objDetCommonCfg.preStartCommonCfg.numSubFrames -1; subFrameIndx >= 0;
-        subFrameIndx--)
-    {
-        subFrameCfg  = &gMmwMssMCB.subFrameCfg[subFrameIndx];
-
-        /*****************************************************************************
-         * Data path :: Algorithm Configuration
-         *****************************************************************************/
-
-        /* Parse the profile and chirp configs and get the valid number of TX Antennas */
-        errCode = MmwDemo_RFParser_parseConfig(&RFparserOutParams, subFrameIndx,
-                                         &gMmwMssMCB.cfg.openCfg, ptrCtrlCfg,
-                                         &subFrameCfg->adcBufCfg,
-                                         gMmwMssMCB.rfFreqScaleFactor,
-                                         subFrameCfg->bpmCfg.isEnabled); 
-
-        if (errCode != 0)
+        // 再次调用config函数，将更新后的配置应用到DPU
+        retVal = DPU_RangeProcHWA_config(subFrmObj->dpuRangeObj, &subFrmObj->rangeCfg);
+        if (retVal != 0)
         {
-            System_printf ("Error: MmwDemo_RFParser_parseConfig [Error:%d]\n", errCode);
+            System_printf("Error: Range DPU re-configuration failed [Error %d]\n", retVal);
             goto exit;
         }
-
-        /* The following code is to enable processing for number of doppler chirps that are
-         * less than 16 (the minimal numDopplerBins supported in doppler DPU DSP).
-         * In this case, interpolate to detect better with CFAR tuning. E.g. a 2 -pt FFT will
-         * be problematic in terms of distinguishing direction of motion */
-        if (RFparserOutParams.numDopplerChirps <= 8)
-        {
-            RFparserOutParams.dopplerStep = RFparserOutParams.dopplerStep / (16 / RFparserOutParams.numDopplerBins);
-            RFparserOutParams.numDopplerBins = 16;
-        }
-
-        subFrameCfg->numRangeBins = RFparserOutParams.numRangeBins;
-        /* Workaround for range DPU limitation for FFT size 1024 and 12 virtual antennas case*/
-        if ((RFparserOutParams.numVirtualAntennas == 12) && (RFparserOutParams.numRangeBins == 1024))
-        {
-            subFrameCfg->numRangeBins = 1022;
-            RFparserOutParams.numRangeBins = 1022;
-        }
-
-        subFrameCfg->numDopplerBins = RFparserOutParams.numDopplerBins;
-        subFrameCfg->numChirpsPerChirpEvent = RFparserOutParams.numChirpsPerChirpEvent;
-        subFrameCfg->adcBufChanDataSize = RFparserOutParams.adcBufChanDataSize;
-        subFrameCfg->objDetDynCfg.dspDynCfg.prepareRangeAzimuthHeatMap = subFrameCfg->guiMonSel.rangeAzimuthHeatMap;
-        subFrameCfg->numAdcSamples = RFparserOutParams.numAdcSamples;
-        subFrameCfg->numChirpsPerSubFrame = RFparserOutParams.numChirpsPerFrame;
-        subFrameCfg->numVirtualAntennas = RFparserOutParams.numVirtualAntennas;
-
-        errCode = MmwDemo_ADCBufConfig(gMmwMssMCB.adcBufHandle,
-                                 gMmwMssMCB.cfg.openCfg.chCfg.rxChannelEn,
-                                 subFrameCfg->numChirpsPerChirpEvent,
-                                 subFrameCfg->adcBufChanDataSize,
-                                 &subFrameCfg->adcBufCfg,
-                                 &staticCfg->ADCBufData.dataProperty.rxChanOffset[0]);
-        if (errCode < 0)
-        {
-            System_printf("Error: ADCBuf config failed with error[%d]\n", errCode);
-            MmwDemo_debugAssert (0);
-        }
-
-        errCode = MmwDemo_configCQ(subFrameCfg, RFparserOutParams.numChirpsPerChirpEvent,
-                                   RFparserOutParams.validProfileIdx);
-
-        if (errCode < 0)
-        {
-            goto exit;
-        }
-
-        /* DPC pre-start config */
-        {
-            int32_t idx;
-
-            objDetPreStartR4fCfg.subFrameNum = subFrameIndx;
-
-            /* Fill static configuration */
-            staticCfg->ADCBufData.data = (void *)SOC_XWR68XX_MSS_ADCBUF_BASE_ADDRESS;
-            staticCfg->ADCBufData.dataProperty.adcBits = 2; /* 16-bit */
-
-            /* only complex format supported */
-            MmwDemo_debugAssert(subFrameCfg->adcBufCfg.adcFmt == 0);
-
-            if (subFrameCfg->adcBufCfg.iqSwapSel == 1)
-            {
-                staticCfg->ADCBufData.dataProperty.dataFmt = DPIF_DATAFORMAT_COMPLEX16_IMRE;
-            }
-            else
-            {
-                staticCfg->ADCBufData.dataProperty.dataFmt = DPIF_DATAFORMAT_COMPLEX16_REIM;
-            }
-            if (subFrameCfg->adcBufCfg.chInterleave == 0)
-            {
-                staticCfg->ADCBufData.dataProperty.interleave = DPIF_RXCHAN_INTERLEAVE_MODE;
-            }
-            else
-            {
-                staticCfg->ADCBufData.dataProperty.interleave = DPIF_RXCHAN_NON_INTERLEAVE_MODE;
-            }
-            staticCfg->ADCBufData.dataProperty.numAdcSamples = RFparserOutParams.numAdcSamples;
-            staticCfg->ADCBufData.dataProperty.numChirpsPerChirpEvent = RFparserOutParams.numChirpsPerChirpEvent;
-            staticCfg->ADCBufData.dataProperty.numRxAntennas = RFparserOutParams.numRxAntennas;
-            staticCfg->ADCBufData.dataSize = RFparserOutParams.numRxAntennas * RFparserOutParams.numAdcSamples * sizeof(cmplx16ImRe_t);
-            staticCfg->numChirpsPerFrame = RFparserOutParams.numChirpsPerFrame;
-            staticCfg->numDopplerChirps = RFparserOutParams.numDopplerChirps;
-            staticCfg->numRangeBins = RFparserOutParams.numRangeBins;
-            staticCfg->numTxAntennas = RFparserOutParams.numTxAntennas;
-            staticCfg->numVirtualAntennas = RFparserOutParams.numVirtualAntennas;
-            staticCfg->centerFreq = RFparserOutParams.centerFreq;
-
-            /* Current 68xx SOC has higher receive level as compared to 18xx and hence using higher value for 
-             * fftOutputDivShift to avoid overflow when converting from 24-bit to 16-bit
-             * TODO: Future RadarSS firmware should be evaluated to assess if these settings are correct
-             */
-            if (RFparserOutParams.numRangeBins >= 1022) 
-            {        
-                staticCfg->rangeFFTtuning.fftOutputDivShift = 1;
-                /* scale only 2 stages */
-                staticCfg->rangeFFTtuning.numLastButterflyStagesToScale = 2; 
-            } 
-            else if (RFparserOutParams.numRangeBins==512)
-            {        
-                staticCfg->rangeFFTtuning.fftOutputDivShift = 2;
-                /* scale last stage */
-                staticCfg->rangeFFTtuning.numLastButterflyStagesToScale = 1; 
-            } 
-            else    
-            {        
-                staticCfg->rangeFFTtuning.fftOutputDivShift = 3;
-                /* no scaling needed as ADC data is 16-bit and we have 8 bits to grow */
-                staticCfg->rangeFFTtuning.numLastButterflyStagesToScale = 0; 
-            }
-            
-            /* objectdetection DSP DPC needs radacube in format DPIF_RADARCUBE_FORMAT_1 */
-            staticCfg->radarCubeFormat = DPIF_RADARCUBE_FORMAT_1; 
-
-            /* Fill dynamic configuration for the sub-frame */
-            objDetPreStartR4fCfg.dynCfg = subFrameCfg->objDetDynCfg.r4fDynCfg;
-
-            DebugP_log1("App: Issuing Pre-start Config IOCTL (subFrameIndx = %d)\n", subFrameIndx);
-
-            /* send pre-start config to R4F chain, using blocking call here */
-            errCode = MmwDemo_DPM_ioctl_blocking (gMmwMssMCB.objDetDpmHandle,
-                                 DPC_OBJDETRANGEHWA_IOCTL__STATIC_PRE_START_CFG,
-                                 &objDetPreStartR4fCfg,
-                                 sizeof (DPC_ObjectDetectionRangeHWA_PreStartCfg));
-            if (errCode < 0)
-            {
-                System_printf ("Error: Unable to send DPC_OBJDETRANGEHWA_IOCTL__STATIC_PRE_START_CFG [Error:%d]\n", errCode);
-                goto exit;
-            }
-            DebugP_log0("App: DPC_OBJDETRANGEHWA_IOCTL__STATIC_PRE_START_CFG is processed \n");
-
-            /***********************************************************************
-              Pre-start preparation for objdetdsp
-             ***********************************************************************/
-            /* Reset preStart config */
-            memset((void *)&objDetPreStartDspCfg, 0, sizeof(DPC_ObjectDetection_PreStartCfg));
-
-            /* DPC configuration */
-            objDetPreStartDspCfg.subFrameNum = subFrameIndx;
-
-            /* Convert CFAR threshold value */
-            subFrameCfg->objDetDynCfg.dspDynCfg.cfarCfgRange.thresholdScale = 
-                MmwDemo_convertCfarToLinear(subFrameCfg->objDetDynCfg.dspDynCfg.cfarCfgRange.thresholdScale, 
-                                            staticCfg->numVirtualAntennas);
-
-            subFrameCfg->objDetDynCfg.dspDynCfg.cfarCfgDoppler.thresholdScale = 
-                MmwDemo_convertCfarToLinear(subFrameCfg->objDetDynCfg.dspDynCfg.cfarCfgDoppler.thresholdScale, 
-                                            staticCfg->numVirtualAntennas);
-                                        
-            objDetPreStartDspCfg.dynCfg = subFrameCfg->objDetDynCfg.dspDynCfg;
-
-            memcpy((void *)&objDetPreStartDspCfg.staticCfg.ADCBufData, 
-                    (void *)&staticCfg->ADCBufData,
-                    sizeof(DPIF_ADCBufData));
-            objDetPreStartDspCfg.staticCfg.dopplerStep = RFparserOutParams.dopplerStep;
-            objDetPreStartDspCfg.staticCfg.isValidProfileHasOneTxPerChirp = RFparserOutParams.validProfileHasOneTxPerChirp;
-            objDetPreStartDspCfg.staticCfg.numChirpsPerFrame = RFparserOutParams.numChirpsPerFrame;
-            objDetPreStartDspCfg.staticCfg.numDopplerBins = RFparserOutParams.numDopplerBins;
-            objDetPreStartDspCfg.staticCfg.numDopplerChirps = RFparserOutParams.numDopplerChirps;
-            objDetPreStartDspCfg.staticCfg.numRangeBins = RFparserOutParams.numRangeBins;
-            objDetPreStartDspCfg.staticCfg.numTxAntennas = RFparserOutParams.numTxAntennas;
-            objDetPreStartDspCfg.staticCfg.numVirtualAntAzim = RFparserOutParams.numVirtualAntAzim;
-            objDetPreStartDspCfg.staticCfg.numVirtualAntElev = RFparserOutParams.numVirtualAntElev;
-            objDetPreStartDspCfg.staticCfg.numVirtualAntennas = RFparserOutParams.numVirtualAntennas;
-            objDetPreStartDspCfg.staticCfg.rangeStep = RFparserOutParams.rangeStep;
-            objDetPreStartDspCfg.staticCfg.isBpmEnabled = subFrameCfg->bpmCfg.isEnabled;
-            objDetPreStartDspCfg.staticCfg.centerFreq = RFparserOutParams.centerFreq;
-            for (idx = 0; idx < RFparserOutParams.numRxAntennas; idx++)
-            {
-                objDetPreStartDspCfg.staticCfg.rxAntOrder[idx] = RFparserOutParams.rxAntOrder[idx];
-            }
-            for (idx = 0; idx < RFparserOutParams.numTxAntennas; idx++)
-            {
-                objDetPreStartDspCfg.staticCfg.txAntOrder[idx] = RFparserOutParams.txAntOrder[idx];
-            }
-
-            for (idx = 0; idx < RFparserOutParams.numRxAntennas; idx++)
-            {
-                objDetPreStartDspCfg.staticCfg.rxAntOrder[idx] = RFparserOutParams.rxAntOrder[idx];
-            }
-            for (idx = 0; idx < RFparserOutParams.numTxAntennas; idx++)
-            {
-                objDetPreStartDspCfg.staticCfg.txAntOrder[idx] = RFparserOutParams.txAntOrder[idx];
-            }
-
-            /* The L3 memory and radarCube memory usage are reported and saved in @ref MmwDemo_DPC_ObjectDetection_reportFxn.
-               The memory information is configured here and passed to objdetdsp chain.
-             */
-            if(gMmwMssMCB.dataPathObj.radarCubeMem.addr != 0)
-            {
-                /* Update DPC radar cube configuration */
-                objDetPreStartDspCfg.shareMemCfg.radarCubeMem.addr = gMmwMssMCB.dataPathObj.radarCubeMem.addr;
-                objDetPreStartDspCfg.shareMemCfg.radarCubeMem.size = gMmwMssMCB.dataPathObj.radarCubeMem.size;
-
-                /* Update DPC L3 RAM configuration */
-                objDetPreStartDspCfg.shareMemCfg.L3Ram.addr = (void *)((uint32_t)(gMmwMssMCB.dataPathObj.radarCubeMem.addr) +
-                                                                   gMmwMssMCB.dataPathObj.memUsage.L3RamUsage);
-                objDetPreStartDspCfg.shareMemCfg.L3Ram.size =gMmwMssMCB.dataPathObj.memUsage.L3RamTotal - gMmwMssMCB.dataPathObj.memUsage.L3RamUsage;
-
-                /* Convert address for DSP core */
-                objDetPreStartDspCfg.shareMemCfg.radarCubeMem.addr = (void *) SOC_translateAddress((uint32_t)objDetPreStartDspCfg.shareMemCfg.radarCubeMem.addr,
-                                                 SOC_TranslateAddr_Dir_TO_OTHER_CPU,
-                                                 &errCode);
-                DebugP_assert ((uint32_t)objDetPreStartDspCfg.shareMemCfg.radarCubeMem.addr != SOC_TRANSLATEADDR_INVALID);
-
-                objDetPreStartDspCfg.shareMemCfg.L3Ram.addr = (void *) SOC_translateAddress((uint32_t)objDetPreStartDspCfg.shareMemCfg.L3Ram.addr,
-                                                 SOC_TranslateAddr_Dir_TO_OTHER_CPU,
-                                                 &errCode);
-                DebugP_assert ((uint32_t)objDetPreStartDspCfg.shareMemCfg.L3Ram.addr != SOC_TRANSLATEADDR_INVALID);
-
-                /* Enable shared memory configuration */
-                objDetPreStartDspCfg.shareMemCfg.shareMemEnable = true;
-            }
-
-            /* send pre-start config */
-            errCode = MmwDemo_DPM_ioctl_blocking (gMmwMssMCB.objDetDpmHandle,
-                                 DPC_OBJDET_IOCTL__STATIC_PRE_START_CFG,
-                                 &objDetPreStartDspCfg,
-                                 sizeof (DPC_ObjectDetection_PreStartCfg));
-            DebugP_log0("App: DPC_OBJDET_IOCTL__STATIC_PRE_START_CFG is processed \n");
-
-            MmwDemo_resetDynObjDetCfgPendingState(&subFrameCfg->objDetDynCfg);
-
-            if (errCode < 0)
-            {
-                System_printf ("Error: Unable to send DPC_OBJDET_IOCTL__STATIC_PRE_START_CFG [Error:%d]\n", errCode);
-                goto exit;
-            }
-        }
     }
+
+    /* 2. 调用 DPU process 函数，启动1D-FFT处理 */
+    retVal = DPU_RangeProcHWA_process(subFrmObj->dpuRangeObj, &outRangeProc);
+    if (retVal != 0)
+    {
+        goto exit;
+    }
+    DebugP_assert(outRangeProc.endOfChirp == true);
+
+    /* 调用帧间处理开始的回调函数 (如果已注册) */
+    if (objDetObj->processCallBackFxn.processInterFrameBeginCallBackFxn != NULL)
+    {
+        (*objDetObj->processCallBackFxn.processInterFrameBeginCallBackFxn)(objDetObj->subFrameIndx);
+    }
+
+    /* 3. 准备将处理结果（即写入的Ping-Pong缓冲区地址）传递给下游的DSS DPC */
+    rangeProcResult.ptrBuffer[0] = (uint8_t *)subFrmObj->rangeCfg.hwRes.radarCube.data;
+    rangeProcResult.size[0]      = subFrmObj->rangeCfg.hwRes.radarCube.dataSize;
+
+    /* 注意：我们将当前的pingPongId“塞”到subFrameIdx中传递给DSS。
+       这是一种常见的、用于在DPM框架内传递额外信息的技巧。*/
+    ((DPC_ObjectDetection_ExecuteResult *)rangeProcResult.ptrBuffer[0])->subFrameIdx = subFrmObj->pingPongId;
+
+
+    /* 4. 通过DPM框架中继结果给DSS */
+    retVal = DPM_relayResult(objDetObj->dpmHandle, handle, &rangeProcResult);
+    DebugP_assert (retVal == 0);
+
+    /* 5. 切换 Ping-Pong 索引，为下一帧做准备 */
+    if (subFrmObj->isCustomBufCfg)
+    {
+        subFrmObj->pingPongId = subFrmObj->pingPongId ^ 1;
+    }
+
+    // ==================> 最终逻辑结束 <==================
+
+    /* 清理传给应用的 DPM_Buffer，因为这个DPC不直接向应用报告结果 */
+    memset ((void *)ptrResult, 0, sizeof(DPM_Buffer));
+    objDetObj->interSubFrameProcToken--;
+
+    /* 更新子帧索引，准备下一帧（仅在多子帧模式下）*/
+    if (objDetObj->commonCfg.numSubFrames > 1U)
+    {
+        objDetObj->subFrameIndx = (objDetObj->subFrameIndx + 1) % objDetObj->commonCfg.numSubFrames;
+        retVal = DPC_ObjDetRangeHwa_reconfigSubFrame(objDetObj, objDetObj->subFrameIndx);
+        DebugP_assert (retVal == 0);
+    }
+
+    /* 为下一帧触发Range DPU */
+    retVal = DPU_RangeProcHWA_control(objDetObj->subFrameObj[objDetObj->subFrameIndx].dpuRangeObj,
+                                      DPU_RangeProcHWA_Cmd_triggerProc, NULL, 0);
+    DPC_Objdet_Assert(objDetObj->dpmHandle, (retVal == 0));
+
+    objDetObj->stats.interFrameStartTimeStamp = Cycleprofiler_getTimeStamp();
+
+    DebugP_log0("ObjDet DPC: Range Proc Done\n");
+
 exit:
-    return errCode;
+    return retVal;
 }
-
 /**
  *  @b Description
  *  @n

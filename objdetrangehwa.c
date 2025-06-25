@@ -72,6 +72,8 @@
 #include <ti/datapath/dpc/objectdetection/objdetrangehwa/include/objdetrangehwainternal.h>
 #include <ti/datapath/dpc/objectdetection/objdetrangehwa/objdetrangehwa.h>
 
+#include "global.h"
+
 #ifdef DBG_DPC_OBJDETRANGEHWA
 ObjDetObj     *gObjDetObj;
 #endif
@@ -687,6 +689,29 @@ int32_t DPC_ObjectDetection_execute
 
     DebugP_log1("ObjDet DPC: Processing sub-frame %d\n", objDetObj->subFrameIndx);
 
+    // ...
+    subFrmObj = &objDetObj->subFrameObj[objDetObj->subFrameIndx];
+
+    if (subFrmObj->isCustomBufCfg)
+    {
+        // 更新配置结构中的输出缓冲区地址
+        subFrmObj->rangeCfg.hwRes.radarCube = subFrmObj->dssPingPongBuf[subFrmObj->pingPongId];
+        // 再次调用config函数，应用新配置
+        retVal = DPU_RangeProcHWA_config(subFrmObj->dpuRangeObj, &subFrmObj->rangeCfg);
+        if (retVal != 0) { goto exit; }
+    }
+
+    // 调用 process 函数
+    retVal = DPU_RangeProcHWA_process(subFrmObj->dpuRangeObj, &outRangeProc);
+    // ...
+
+    // 切换 pingPongId
+    if (subFrmObj->isCustomBufCfg)
+    {
+        subFrmObj->pingPongId = subFrmObj->pingPongId ^ 1;
+    }
+    // ...
+
     subFrmObj = &objDetObj->subFrameObj[objDetObj->subFrameIndx];
     if (objDetObj->processCallBackFxn.processFrameBeginCallBackFxn != NULL)
     {
@@ -994,26 +1019,20 @@ static int32_t DPC_ObjectDetection_ioctl
                 break;
             }
 
-            // 【新增】处理来自下游DPC（DSS）的缓冲区设置命令
-            case DPC_OBJDET_IOCTL__SET_PING_PONG_BUFFER:
+            // 【新增】
+            case MMWDEMO_DPC_OBJDETRANGEHWA_IOCTL__SET_OUTPUT_BUFFERS:
             {
-                DPIF_RadarCube* pingPongBuffers = (DPIF_RadarCube*)arg;
+                DPC_ObjectDetectionRangeHWA_setOutBufCfg* cfg = (DPC_ObjectDetectionRangeHWA_setOutBufCfg*)arg;
+                subFrmObj = &objDetObj->subFrameObj[cfg->subFrameNum];
 
-                // 将这两个地址保存到 objDetObj 的某个新成员中
-                // 比如 objDetObj->dssPingPongBuffer[0] = pingPongBuffers[0];
-                //      objDetObj->dssPingPongBuffer[1] = pingPongBuffers[1];
+                // 【修改点】保存到我们新定义的扩展结构体中
+                subFrmObj->isCustomBufCfg = true;
+                subFrmObj->dssPingPongBuf[0] = cfg->radarCube[0];
+                subFrmObj->dssPingPongBuf[1] = cfg->radarCube[1];
 
-                // 接下来，您需要配置 RangeProcHWA DPU，让它的输出
-                // 交替地写入这两个地址。这通常是通过修改EDMA的
-                // 目标地址来实现的。
-                DPU_RangeProcHWA_control(objDetObj->dpuRangeObj,
-                                         DPU_RangeProcHWA_Cmd_setCustomBuffer,
-                                         pingPongBuffers,
-                                         sizeof(DPIF_RadarCube) * 2);
-
+                // 【移除】不再需要调用 DPU_RangeProcHWA_control
                 break;
             }
-
             default:
             {
                 /* Error: This is an unsupported command */
