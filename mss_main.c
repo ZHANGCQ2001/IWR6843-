@@ -2844,52 +2844,55 @@ static void MmwDemo_handleObjectDetResult
 {
     int32_t     retVal;
     DPC_ObjectDetection_ExecuteResultExportedInfo exportInfo;
-    MmwDemo_output_custom_result            *dpcResults;
-    MmwDemo_output_message_stats            *frameStats;
-    volatile uint32_t                        startTime;
-    uint8_t                                  nextSubFrameIdx;
-    uint8_t                                  numSubFrames;
-    uint8_t                                  currSubFrameIdx;
-    uint8_t                                  prevSubFrameIdx;
-    MmwDemo_SubFrameStats                    *currSubFrameStats;
-    MmwDemo_SubFrameStats                    *prevSubFrameStats;
+
+    /* 1. 定义指向整个HSRAM结构和您的自定义结果的指针 */
+    MmwDemo_HSRAM                   *ptrHsram;
+    MmwDemo_output_custom_result    *customResult;
+    MmwDemo_output_message_stats    *outputStats;
+
+    volatile uint32_t                startTime;
+    uint8_t                          currSubFrameIdx;
+    MmwDemo_SubFrameStats           *currSubFrameStats;
 
     /*****************************************************************
      * datapath has finished frame processing, results are reported
      *****************************************************************/
 
-    /* Validate DPC results buffer */
-    DebugP_assert (ptrResult->size[0] == sizeof(MmwDemo_output_custom_result));
+    /* 2. 验证从DSS收到的缓冲区大小是否为 MmwDemo_HSRAM 的大小 */
+    /* 这是您在 dpmTask 中设置的 DPM_sendResult 的 size[0]         */
+    DebugP_assert (ptrResult->size[0] == sizeof(MmwDemo_HSRAM));
 
-    /* Translate the address: */
-    dpcResults = (MmwDemo_output_custom_result *)SOC_translateAddress((uint32_t)ptrResult->ptrBuffer[0],
-                                             SOC_TranslateAddr_Dir_FROM_OTHER_CPU,
-                                             &retVal);
+    /* 3. 将收到的指针转换为指向共享内存HSRAM的指针 */
+    ptrHsram = (MmwDemo_HSRAM *)SOC_translateAddress(
+                                    (uint32_t)ptrResult->ptrBuffer[0],
+                                    SOC_TranslateAddr_Dir_FROM_OTHER_CPU,
+                                    &retVal);
+    DebugP_assert ((uint32_t)ptrHsram != SOC_TRANSLATEADDR_INVALID);
+
     mss_frame_cnt++;
-    g_resultptr = dpcResults;
-    DebugP_assert ((uint32_t)dpcResults != SOC_TRANSLATEADDR_INVALID);
 
-    /* Validate timing Info buffer */
-    DebugP_assert (ptrResult->size[1] == sizeof(MmwDemo_output_message_stats));
+    /* 4. 从HSRAM的payload中提取您的自定义结果 */
+    customResult = (MmwDemo_output_custom_result *)&ptrHsram->payload[0];
 
-    numSubFrames = gMmwMssMCB.objDetCommonCfg.preStartCommonCfg.numSubFrames;
-    currSubFrameIdx = 0;
-    prevSubFrameIdx = MmwDemo_getPrevSubFrameIndx(currSubFrameIdx, numSubFrames);
-    currSubFrameStats = &gMmwMssMCB.subFrameStats[currSubFrameIdx];
-    prevSubFrameStats = &gMmwMssMCB.subFrameStats[prevSubFrameIdx];
+    currSubFrameIdx = customResult->subFrameIdx;
+
+    /* 5. 从HSRAM的outStats字段中提取统计信息 */
+    outputStats = &ptrHsram->outStats;
+
 
     /*****************************************************************
      * Transmit results
      *****************************************************************/
     startTime = Cycleprofiler_getTimeStamp();
 
-//    /* Transmit processing results for the frame */
-//    if(mss_frame_cnt != 0)
-//    {
-//        MmwDemo_transmitProcessedOutput(gMmwMssMCB.loggingUartHandle,
-//                                    dpcResults,
-//                                    &currSubFrameStats->outputStats);
-//    }
+    // 将提取出的正确结果和统计信息传递给发送函数
+    if(mss_frame_cnt != 0)
+    {
+        // 注意：这里我们传递 customResult 和 outputStats
+        MmwDemo_transmitProcessedOutput(gMmwMssMCB.loggingUartHandle,
+                                        customResult,
+                                        outputStats);
+    }
 
     /* Update current frame transmit time */
     currSubFrameStats->outputStats.transmitOutputTime = (Cycleprofiler_getTimeStamp() - startTime)/R4F_CLOCK_MHZ; /* In micro seconds */
@@ -2913,6 +2916,82 @@ static void MmwDemo_handleObjectDetResult
         MmwDemo_debugAssert (0);
     }
 }
+//static void MmwDemo_handleObjectDetResult
+//(
+//    DPM_Buffer  *ptrResult
+//)
+//{
+//    int32_t     retVal;
+//    DPC_ObjectDetection_ExecuteResultExportedInfo exportInfo;
+//    MmwDemo_output_custom_result            *dpcResults;
+//    MmwDemo_output_message_stats            *frameStats;
+//    volatile uint32_t                        startTime;
+//    uint8_t                                  nextSubFrameIdx;
+//    uint8_t                                  numSubFrames;
+//    uint8_t                                  currSubFrameIdx;
+//    uint8_t                                  prevSubFrameIdx;
+//    MmwDemo_SubFrameStats                    *currSubFrameStats;
+//    MmwDemo_SubFrameStats                    *prevSubFrameStats;
+//
+//    /*****************************************************************
+//     * datapath has finished frame processing, results are reported
+//     *****************************************************************/
+//
+//    /* Validate DPC results buffer */
+//    DebugP_assert (ptrResult->size[0] == sizeof(MmwDemo_output_custom_result));
+//
+//    /* Translate the address: */
+//    dpcResults = (MmwDemo_output_custom_result *)SOC_translateAddress((uint32_t)ptrResult->ptrBuffer[0],
+//                                             SOC_TranslateAddr_Dir_FROM_OTHER_CPU,
+//                                             &retVal);
+//    mss_frame_cnt++;
+//    g_resultptr = dpcResults;
+//    DebugP_assert ((uint32_t)dpcResults != SOC_TRANSLATEADDR_INVALID);
+//
+//    /* Validate timing Info buffer */
+//    DebugP_assert (ptrResult->size[1] == sizeof(MmwDemo_output_message_stats));
+//
+//    numSubFrames = gMmwMssMCB.objDetCommonCfg.preStartCommonCfg.numSubFrames;
+//    currSubFrameIdx = 0;
+//    prevSubFrameIdx = MmwDemo_getPrevSubFrameIndx(currSubFrameIdx, numSubFrames);
+//    currSubFrameStats = &gMmwMssMCB.subFrameStats[currSubFrameIdx];
+//    prevSubFrameStats = &gMmwMssMCB.subFrameStats[prevSubFrameIdx];
+//
+//    /*****************************************************************
+//     * Transmit results
+//     *****************************************************************/
+//    startTime = Cycleprofiler_getTimeStamp();
+//
+////    /* Transmit processing results for the frame */
+////    if(mss_frame_cnt != 0)
+////    {
+////        MmwDemo_transmitProcessedOutput(gMmwMssMCB.loggingUartHandle,
+////                                    dpcResults,
+////                                    &currSubFrameStats->outputStats);
+////    }
+//
+//    /* Update current frame transmit time */
+//    currSubFrameStats->outputStats.transmitOutputTime = (Cycleprofiler_getTimeStamp() - startTime)/R4F_CLOCK_MHZ; /* In micro seconds */
+//    transfer_time = currSubFrameStats->outputStats.transmitOutputTime;
+//
+//
+//    currSubFrameStats->subFramePreparationTime = 0;
+//
+//    /*****************************************************************
+//     * Send notification to data path after results are handled
+//     *****************************************************************/
+//    /* Indicate result consumed and end of frame/sub-frame processing */
+//    exportInfo.subFrameIdx = currSubFrameIdx;
+//    retVal = DPM_ioctl (gMmwMssMCB.objDetDpmHandle,
+//                         DPC_OBJDET_IOCTL__DYNAMIC_EXECUTE_RESULT_EXPORTED,
+//                         &exportInfo,
+//                         sizeof (DPC_ObjectDetection_ExecuteResultExportedInfo));
+//    if (retVal < 0) {
+//        System_printf ("Error: DPM DPC_OBJDET_IOCTL__DYNAMIC_EXECUTE_RESULT_EXPORTED failed [Error code %d]\n",
+//                       retVal);
+//        MmwDemo_debugAssert (0);
+//    }
+//}
 
 /**
  *  @b Description

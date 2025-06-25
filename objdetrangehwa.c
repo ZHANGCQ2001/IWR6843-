@@ -858,6 +858,7 @@ static int32_t DPC_ObjectDetection_stop (DPM_DPCHandle handle)
  *  @retval
  *      Error   -   <0
  */
+// objdetrangehwa.c DPC_ObjectDetection_ioctl函数
 static int32_t DPC_ObjectDetection_ioctl
 (
     DPM_DPCHandle   handle,
@@ -990,6 +991,26 @@ static int32_t DPC_ObjectDetection_ioctl
                 memUsage->SystemHeapDPCUsed = statsStart.totalFreeSize - statsEnd.totalFreeSize;
 
                 DebugP_log1("ObjDet DPC: Pre-start Config IOCTL processed (subFrameIndx = %d)\n", cfg->subFrameNum);
+                break;
+            }
+
+            // 【新增】处理来自下游DPC（DSS）的缓冲区设置命令
+            case DPC_OBJDET_IOCTL__SET_PING_PONG_BUFFER:
+            {
+                DPIF_RadarCube* pingPongBuffers = (DPIF_RadarCube*)arg;
+
+                // 将这两个地址保存到 objDetObj 的某个新成员中
+                // 比如 objDetObj->dssPingPongBuffer[0] = pingPongBuffers[0];
+                //      objDetObj->dssPingPongBuffer[1] = pingPongBuffers[1];
+
+                // 接下来，您需要配置 RangeProcHWA DPU，让它的输出
+                // 交替地写入这两个地址。这通常是通过修改EDMA的
+                // 目标地址来实现的。
+                DPU_RangeProcHWA_control(objDetObj->dpuRangeObj,
+                                         DPU_RangeProcHWA_Cmd_setCustomBuffer,
+                                         pingPongBuffers,
+                                         sizeof(DPIF_RadarCube) * 2);
+
                 break;
             }
 

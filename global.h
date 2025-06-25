@@ -9,6 +9,7 @@
 
 // 存储结果结构体
 typedef struct MmwDemo_output_custom_result_t {
+    uint8_t             subFrameIdx;
     uint16_t            x;              // 距离波门
     uint16_t            velocity;       // 速度波门
     uint16_t            snr;            // 信噪比

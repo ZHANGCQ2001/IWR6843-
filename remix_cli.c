@@ -133,7 +133,7 @@ CLI_MCB     gCLI;
      ///chirpCfg <chirpStartIdx> <chirpEndIdx> <profileId> <startFreqVar> <freqSlopeVar> <idleTimeVar> <adcStartTimeVar> <txEnable>
      "chirpCfg 0 0 0 0 0 0 0 1",
      ///frameCfg <chirpStartIdx> <chirpEndIdx> <numLoops> <numFrames> <framePeriodicity> <triggerSelect> <frameTriggerDelay>
-     "frameCfg 0 0 128 0 7 1 0",
+     "frameCfg 0 0 128 0 10 1 0",
      "guiMonitor -1 1 1 1 0 0 1",
      "cfarCfg -1 0 2 8 4 3 0 15.0 0",
      "cfarCfg -1 1 0 4 2 3 1 15.0 0",

@@ -93,6 +93,7 @@
 #include "gen_twiddle_fft16x16.h"
 #include "DSP_fft32x32.h"
 #include "DSP_fft16x16.h"
+#include <ti/sysbios/hal/Cache.h>
 
 #include "dss_config_edma_util.h"
 
@@ -947,20 +948,34 @@ int32_t Remix_DSS_dataPathConfigEdma(DSS_DataPathObj *obj, DPC_ObjectDetection_E
 static void MmwDemo_DPC_ObjectDetection_dataProcessingTask(UArg arg0, UArg arg1)
 {
     DSS_DataPathObj *obj = gMCBobj;
-    int32_t retVal = 0;
-    volatile bool isTransferDone;
-    DSS_dataPathConfigFFTs(obj);
+    DSS_dataPathConfigFFTs(obj); // 初始化FFT所需的系数等
+
     while(1)
     {
-        // 等待新帧信号
+        // 1. 阻塞等待 dpmTask 的信号，表示有新的1D-FFT数据需要处理
         SemaphoreP_pend(Semaphore_FrameStartSem, SemaphoreP_WAIT_FOREVER);
 
-        // 获取PINGPONG号
+        // 2. 从全局变量获取当前需要处理的缓冲区索引
         uint8_t processingId = g_processingPingPongId;
 
+        /* * 【重要】在CPU访问之前，对即将被读取的内存区域进行缓存无效化。
+         * 1D-FFT的结果是由HWA/R4F写入的，DSP的缓存可能不是最新的。
+         */
+        Cache_inv(obj->radarCubePrev[processingId],
+                  obj->numRangeBins * obj->numDopplerBins * obj->numRxAntennas * obj->numTxAntennas * sizeof(cmplx16ImRe_t),
+                  Cache_Type_ALLD,
+                  true);
+
+        // 3. 调用处理函数，它内部会触发自己的Ping-Pong EDMA来处理数据
         process2DFFT(obj, processingId);
 
-        // 【关键】设置标志位，通知 dpmTask "这个缓冲区的结果已经准备好了"
+        /* * 4. 【重要】将计算结果写入对应的存储区。
+         * 假设process2DFFT内部已经将结果写入了gMCBresult[processingId]指向的内存。
+         * 在设置标志位之前，需要确保数据已经从CPU缓存写回主内存。
+         */
+        Cache_wb(gMCBresult[processingId], sizeof(MmwDemo_output_custom_result), Cache_Type_ALLD, true);
+
+        // 5. 设置标志位，通知 dpmTask "这个缓冲区的结果已经准备好了"
         g_isResultReady[processingId] = true;
     }
 }
@@ -1374,20 +1389,22 @@ void MmwDemo_dataPathWait2DInputData(DSS_DataPathObj *obj, uint32_t pingPongId, 
 static void MmwDemo_DPC_ObjectDetection_dpmTask(UArg arg0, UArg arg1)
 {
     int32_t     retVal;
-    DPC_ObjectDetection_ExecuteResult *result_1D; // 重命名以示区分
+    DPC_ObjectDetection_ExecuteResult *result_1D; // 用于接收1D-FFT的原始结果
 
     while (1)
     {
-        // --- 1. 检查【上一个】缓冲区的结果是否已经计算完毕 ---
-        uint8_t prevPingPongId = g_dpmPingPongId ^ 1;
+        /* * --- 第1步: 检查【上一帧】的结果是否已经计算完毕并发送 ---
+         * 这个检查确保了流水线不会因为结果处理不及时而阻塞。
+         */
+        uint8_t prevPingPongId = g_dpmPingPongId ^ 1; // 计算上一个缓冲区的索引
         if (g_isResultReady[prevPingPongId] == true)
         {
             volatile uint32_t startTime = Cycleprofiler_getTimeStamp();
 
-            // 从对应的存储区获取最终结果
+            // 从对应的存储区获取最终计算结果
             MmwDemo_output_custom_result* finalResult = gMCBresult[prevPingPongId];
 
-            // 将最终结果拷贝到HSRAM以供MSS访问
+            // 将最终结果拷贝到HSRAM以供MSS核访问
             if ((retVal = MmwDemo_copyResultToHSRAM(&gHSRAM, finalResult, &gMmwDssMCB.dataPathObj.subFrameStats[finalResult->subFrameIdx])) >= 0)
             {
                 gHSRAM.outStats.interFrameProcessingMargin -= ((Cycleprofiler_getTimeStamp() - startTime)/DSP_CLOCK_MHZ);
@@ -1407,48 +1424,36 @@ static void MmwDemo_DPC_ObjectDetection_dpmTask(UArg arg0, UArg arg1)
                  MmwDemo_debugAssert (0);
             }
 
-            // 清除标志位，表示结果已发送
+            // 清除标志位，表示结果已处理完毕
             g_isResultReady[prevPingPongId] = false;
         }
 
-
-        // --- 2. 阻塞等待DPM框架完成硬件操作和1D-FFT ---
+        /* * --- 第2步: 阻塞等待DPM框架完成硬件操作和1D-FFT ---
+         * DPM_execute 会在有新数据时返回，否则会阻塞，让出CPU给其他任务。
+         */
         retVal = DPM_execute (gMmwDssMCB.dataPathObj.objDetDpmHandle, &resultBuffer);
 
-        if (retVal == DPM_SOK)
+        if (retVal == DPM_SOK && resultBuffer.size[0] > 0)
         {
-            if ((resultBuffer.size[0] == sizeof(DPC_ObjectDetection_ExecuteResult)))
-            {
-                result_1D = (DPC_ObjectDetection_ExecuteResult *)resultBuffer.ptrBuffer[0];
+            result_1D = (DPC_ObjectDetection_ExecuteResult *)resultBuffer.ptrBuffer[0];
+            MmwDemo_updateObjectDetStats(result_1D->stats, &gMmwDssMCB.dataPathObj.subFrameStats[result_1D->subFrameIdx]);
 
-                // 更新统计信息
-                MmwDemo_updateObjectDetStats(result_1D->stats, &gMmwDssMCB.dataPathObj.subFrameStats[result_1D->subFrameIdx]);
+            /* * 【移除】不再需要EDMA拷贝，因为我们假设1D-FFT的结果
+             * 已经由上游DPC直接写入了正确的Ping-Pong缓冲区。
+             * DPM_execute返回的结果 result_1D->radarCube.data 应该
+             * 直接指向 gMCBobj->radarCubePrev[g_dpmPingPongId]。
+             * (这一步需要您确认上游DPC的配置)
+             */
 
-                // --- 3. 将1D-FFT结果通过EDMA拷贝到【当前】Ping-Pong缓冲区 ---
-                uint8_t chId_CubeCopy = MRR_SF0_EDMA_CH_1D_IN_PING;
-                // 更新EDMA的源和目标地址
-                EDMA_setSourceAddress(gMmwDssMCB.dataPathObj.edmaHandle, chId_CubeCopy, (uint32_t)result_1D->radarCube.data);
-                EDMA_setDestinationAddress(gMmwDssMCB.dataPathObj.edmaHandle, chId_CubeCopy, (uint32_t)gMCBobj->radarCubePrev[g_dpmPingPongId]);
-                // 触发EDMA传输
-                EDMA_startDmaTransfer(gMmwDssMCB.dataPathObj.edmaHandle, chId_CubeCopy);
+            /* * --- 第3步: 通知 dataProcessingTask 开始处理这个缓冲区 ---
+             * 这是流水线的核心：分派任务后立即继续。
+             */
+            g_processingPingPongId = g_dpmPingPongId;
+            SemaphoreP_post(Semaphore_FrameStartSem);
 
-                // 等待拷贝完成
-                volatile bool isTransferDone;
-                do {
-                   if (EDMA_isTransferComplete(gMmwDssMCB.dataPathObj.edmaHandle, chId_CubeCopy, (bool *)&isTransferDone) != EDMA_NO_ERROR)
-                   { MmwDemo_debugAssert(0); }
-                } while (isTransferDone == false);
-
-                // 拷贝完成后，对目标内存区域进行缓存无效化
-                Cache_inv(gMCBobj->radarCubePrev[g_dpmPingPongId], result_1D->radarCube.dataSize, Cache_Type_ALLD, true);
-
-                // --- 4. 通知 dataProcessingTask 开始处理这个缓冲区 ---
-                g_processingPingPongId = g_dpmPingPongId;
-                SemaphoreP_post(Semaphore_FrameStartSem);
-
-                // --- 5. 切换到下一个Ping-Pong缓冲区，为下一帧做准备 ---
-                g_dpmPingPongId = g_dpmPingPongId ^ 1;
-            }
+            /* * --- 第4步: 切换到下一个Ping-Pong缓冲区，为下一帧做准备 ---
+             */
+            g_dpmPingPongId = g_dpmPingPongId ^ 1;
         }
         else if (retVal < 0 && retVal != DPM_ENOEXEC)
         {
@@ -1457,7 +1462,6 @@ static void MmwDemo_DPC_ObjectDetection_dpmTask(UArg arg0, UArg arg1)
         }
     }
 }
-
 /**
  *  @b Description
  *  @n
