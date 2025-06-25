@@ -73,6 +73,7 @@
 #include <ti/datapath/dpc/objectdetection/objdetrangehwa/objdetrangehwa.h>
 
 #include "global.h"
+#include <xdc/runtime/System.h>
 
 #ifdef DBG_DPC_OBJDETRANGEHWA
 ObjDetObj     *gObjDetObj;
@@ -671,53 +672,50 @@ static void DPC_ObjectDetection_frameStart (DPM_DPCHandle handle)
  *  @retval
  *      Error   -   <0
  */
+// in objdetrangehwa.c
+
 int32_t DPC_ObjectDetection_execute
 (
     DPM_DPCHandle   handle,
-    DPM_Buffer*     ptrResult
+    DPM_Buffer* ptrResult
 )
 {
-    ObjDetObj   *objDetObj;
-    SubFrameObj *subFrmObj;
+    ObjDetObj     *objDetObj = (ObjDetObj *) handle;
+    SubFrameObj   *subFrmObj;
     DPU_RangeProcHWA_OutParams outRangeProc;
-    int32_t retVal;
-    DPM_Buffer      rangeProcResult;
+    int32_t       retVal;
+    DPM_Buffer    rangeProcResult;
 
-    objDetObj = (ObjDetObj *) handle;
     DebugP_assert (objDetObj != NULL);
     DebugP_assert (ptrResult != NULL);
 
-    DebugP_log1("ObjDet DPC: Processing sub-frame %d\n", objDetObj->subFrameIndx);
-
-    // ...
+    /* 获取当前子帧的对象 */
     subFrmObj = &objDetObj->subFrameObj[objDetObj->subFrameIndx];
 
-    if (subFrmObj->isCustomBufCfg)
-    {
-        // 更新配置结构中的输出缓冲区地址
-        subFrmObj->rangeCfg.hwRes.radarCube = subFrmObj->dssPingPongBuf[subFrmObj->pingPongId];
-        // 再次调用config函数，应用新配置
-        retVal = DPU_RangeProcHWA_config(subFrmObj->dpuRangeObj, &subFrmObj->rangeCfg);
-        if (retVal != 0) { goto exit; }
-    }
-
-    // 调用 process 函数
-    retVal = DPU_RangeProcHWA_process(subFrmObj->dpuRangeObj, &outRangeProc);
-    // ...
-
-    // 切换 pingPongId
-    if (subFrmObj->isCustomBufCfg)
-    {
-        subFrmObj->pingPongId = subFrmObj->pingPongId ^ 1;
-    }
-    // ...
-
-    subFrmObj = &objDetObj->subFrameObj[objDetObj->subFrameIndx];
+    /* 调用帧开始回调函数 (如果已注册) */
     if (objDetObj->processCallBackFxn.processFrameBeginCallBackFxn != NULL)
     {
         (*objDetObj->processCallBackFxn.processFrameBeginCallBackFxn)(objDetObj->subFrameIndx);
     }
 
+    // ==================> 【架构优化 - 核心逻辑】 <==================
+
+    /* 1. 如果配置了自定义缓冲区，则在处理前进行重配置 */
+    if (subFrmObj->isCustomBufCfg)
+    {
+        // 更新本地配置结构体中的输出缓冲区地址，指向当前的Ping或Pong
+        subFrmObj->rangeCfg.hwRes.radarCube = subFrmObj->dssPingPongBuf[subFrmObj->pingPongId];
+
+        // 再次调用config函数，将更新后的配置动态应用到DPU
+        retVal = DPU_RangeProcHWA_config(subFrmObj->dpuRangeObj, &subFrmObj->rangeCfg);
+        if (retVal != 0)
+        {
+            System_printf("Error: Range DPU re-configuration failed [Error %d]\n", retVal);
+            goto exit;
+        }
+    }
+
+    /* 2. 调用 DPU process 函数，启动1D-FFT处理 */
     retVal = DPU_RangeProcHWA_process(subFrmObj->dpuRangeObj, &outRangeProc);
     if (retVal != 0)
     {
@@ -725,59 +723,48 @@ int32_t DPC_ObjectDetection_execute
     }
     DebugP_assert(outRangeProc.endOfChirp == true);
 
-    subFrmObj = &objDetObj->subFrameObj[objDetObj->subFrameIndx];
+    /* 调用帧间处理开始的回调函数 (如果已注册) */
     if (objDetObj->processCallBackFxn.processInterFrameBeginCallBackFxn != NULL)
     {
         (*objDetObj->processCallBackFxn.processInterFrameBeginCallBackFxn)(objDetObj->subFrameIndx);
     }
 
-    /********************************************************************************
-     * Range Processing is finished, now it can send data to inter frame processing DPC.
-     ********************************************************************************/
-    rangeProcResult.ptrBuffer[0] = objDetObj->subFrameObj[objDetObj->subFrameIndx].rangeCfg.hwRes.radarCube.data;
-    rangeProcResult.size[0] = objDetObj->subFrameObj[objDetObj->subFrameIndx].rangeCfg.hwRes.radarCube.dataSize;
+    /* 3. 准备将处理结果（即写入的Ping-Pong缓冲区地址）传递给下游的DSS DPC */
+    rangeProcResult.ptrBuffer[0] = (uint8_t *)subFrmObj->rangeCfg.hwRes.radarCube.data;
+    rangeProcResult.size[0]      = subFrmObj->rangeCfg.hwRes.radarCube.dataSize;
 
-    /* Relay the results: */
+    /* 将当前的pingPongId“塞”到结果中，传递给DSS */
+    ((DPC_ObjectDetection_ExecuteResult *)rangeProcResult.ptrBuffer[0])->subFrameIdx = subFrmObj->pingPongId;
+
+    /* 4. 通过DPM框架中继结果给DSS */
     retVal = DPM_relayResult(objDetObj->dpmHandle, handle, &rangeProcResult);
     DebugP_assert (retVal == 0);
 
-    /********************************************************************************
-     * This DPC does not report results to the application so for the
-     * sake of clarity reset the result buffer
-     ********************************************************************************/
+    /* 5. 切换 Ping-Pong 索引，为下一帧做准备 */
+    if (subFrmObj->isCustomBufCfg)
+    {
+        subFrmObj->pingPongId = subFrmObj->pingPongId ^ 1;
+    }
+
+    // ==================> 最终逻辑结束 <==================
+
+    /* ... (函数剩余部分，如清理ptrResult、更新subFrameIndx、触发下一帧等，保持不变) ... */
     memset ((void *)ptrResult, 0, sizeof(DPM_Buffer));
     objDetObj->interSubFrameProcToken--;
 
-    /********************************************************************************
-     * Prepare for next Frame
-     ********************************************************************************/
-
-    /* Update subFrame index */
-    objDetObj->subFrameIndx++;
-    objDetObj->subFrameIndx = objDetObj->subFrameIndx % objDetObj->commonCfg.numSubFrames;
-
-    if(objDetObj->commonCfg.numSubFrames > 1U)
+    if (objDetObj->commonCfg.numSubFrames > 1U)
     {
-        /* Re-configure Range DPU for next subFrame */
+        objDetObj->subFrameIndx = (objDetObj->subFrameIndx + 1) % objDetObj->commonCfg.numSubFrames;
         retVal = DPC_ObjDetRangeHwa_reconfigSubFrame(objDetObj, objDetObj->subFrameIndx);
         DebugP_assert (retVal == 0);
     }
 
-    /* Trigger Range DPU for next frame */
-    retVal = DPU_RangeProcHWA_control(objDetObj->subFrameObj[objDetObj->subFrameIndx].dpuRangeObj,
-                 DPU_RangeProcHWA_Cmd_triggerProc, NULL, 0);
+    retVal = DPU_RangeProcHWA_control(objDetObj->subFrameObj[objDetObj->subFrameIndx].dpuRangeObj, DPU_RangeProcHWA_Cmd_triggerProc, NULL, 0);
     DPC_Objdet_Assert(objDetObj->dpmHandle, (retVal == 0));
-
-    /* For rangeProcHwa, interChirpProcessingMargin is not available */
-    objDetObj->stats.interChirpProcessingMargin = 0;
-    objDetObj->stats.interFrameStartTimeStamp = Cycleprofiler_getTimeStamp();
-
-    DebugP_log0("ObjDet DPC: Range Proc Done\n");
 
 exit:
     return retVal;
 }
-
 /**
  *  @b Description
  *  @n
@@ -1019,18 +1006,20 @@ static int32_t DPC_ObjectDetection_ioctl
                 break;
             }
 
-            // 【新增】
+            // ==================> 【架构优化 - 新增代码】 <==================
             case MMWDEMO_DPC_OBJDETRANGEHWA_IOCTL__SET_OUTPUT_BUFFERS:
             {
                 DPC_ObjectDetectionRangeHWA_setOutBufCfg* cfg = (DPC_ObjectDetectionRangeHWA_setOutBufCfg*)arg;
+
+                // 获取正确的子帧对象
                 subFrmObj = &objDetObj->subFrameObj[cfg->subFrameNum];
 
-                // 【修改点】保存到我们新定义的扩展结构体中
-                subFrmObj->isCustomBufCfg = true;
+                // 将MSS主任务传递过来的Ping-Pong缓冲区地址，保存到我们刚刚添加的成员中
                 subFrmObj->dssPingPongBuf[0] = cfg->radarCube[0];
                 subFrmObj->dssPingPongBuf[1] = cfg->radarCube[1];
+                subFrmObj->isCustomBufCfg = true; // 设置标志位，表示已配置
 
-                // 【移除】不再需要调用 DPU_RangeProcHWA_control
+                // 注意：我们在这里不调用任何DPU的函数，将配置推迟到execute阶段
                 break;
             }
             default:

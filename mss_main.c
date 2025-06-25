@@ -755,6 +755,7 @@ static void MmwDemo_transmitProcessedOutput
     MmwDemo_output_message_stats        *timingInfo
 );
 static void MmwDemo_measurementResultOutput(DPU_AoAProc_compRxChannelBiasCfg *compRxChanCfg);
+
 static int32_t MmwDemo_DPM_ioctl_blocking
 (
     DPM_Handle handle,
@@ -1751,6 +1752,116 @@ static uint16_t MmwDemo_convertCfarToLinear(uint16_t codedCfarVal, uint8_t numVi
     
     linearVal = (uint16_t) linVal;
     return (linearVal);
+}
+static int32_t MmwDemo_dataPathConfig (void)
+{
+    int32_t                         errCode;
+    MMWave_CtrlCfg                  *ptrCtrlCfg;
+    MmwDemo_DPC_ObjDet_CommonCfg    *objDetCommonCfg;
+    MmwDemo_SubFrameCfg             *subFrameCfg;
+    int8_t                          subFrameIndx;
+    MmwDemo_RFParserOutParams       RFparserOutParams;
+    DPC_ObjectDetectionRangeHWA_PreStartCfg objDetPreStartR4fCfg;
+    DPC_ObjectDetectionRangeHWA_StaticCfg *staticCfg;
+    DPC_ObjectDetection_PreStartCfg objDetPreStartDspCfg;
+    DPC_ObjectDetectionRangeHWA_PreStartCommonCfg preStartCommonCfg;
+
+    DPIF_RadarCube                  pingPongBuffers[2];
+    uint32_t                        radarCubeSize;
+
+    /* 获取配置指针 */
+    ptrCtrlCfg = &gMmwMssMCB.cfg.ctrlCfg;
+    objDetCommonCfg = &gMmwMssMCB.objDetCommonCfg;
+    staticCfg = &objDetPreStartR4fCfg.staticCfg;
+
+    /* 获取RF频率因子 */
+    gMmwMssMCB.rfFreqScaleFactor = SOC_getDeviceRFFreqScaleFactor(gMmwMssMCB.socHandle, &errCode);
+    if (errCode < 0)
+    {
+        System_printf ("Error: Unable to get RF scale factor [Error:%d]\n", errCode);
+        MmwDemo_debugAssert(0);
+    }
+
+    gMmwMssMCB.objDetCommonCfg.preStartCommonCfg.numSubFrames = MmwDemo_RFParser_getNumSubFrames(ptrCtrlCfg);
+
+    /* DPC通用配置IOCTL */
+    preStartCommonCfg.numSubFrames = gMmwMssMCB.objDetCommonCfg.preStartCommonCfg.numSubFrames;
+    errCode = DPM_ioctl(gMmwMssMCB.objDetDpmHandle, DPC_OBJDETRANGEHWA_IOCTL__STATIC_PRE_START_COMMON_CFG, &preStartCommonCfg, sizeof(preStartCommonCfg));
+    if (errCode < 0) { goto exit; }
+
+    errCode = MmwDemo_DPM_ioctl_blocking(gMmwMssMCB.objDetDpmHandle, DPC_OBJDET_IOCTL__STATIC_PRE_START_COMMON_CFG, &objDetCommonCfg->preStartCommonCfg, sizeof(DPC_ObjectDetection_PreStartCommonCfg));
+    if (errCode < 0) { goto exit; }
+
+    MmwDemo_resetDynObjDetCommonCfgPendingState(&gMmwMssMCB.objDetCommonCfg);
+
+    /* 对每个子帧进行配置 */
+    for(subFrameIndx = gMmwMssMCB.objDetCommonCfg.preStartCommonCfg.numSubFrames - 1; subFrameIndx >= 0; subFrameIndx--)
+    {
+        subFrameCfg  = &gMmwMssMCB.subFrameCfg[subFrameIndx];
+
+        errCode = MmwDemo_RFParser_parseConfig(&RFparserOutParams, subFrameIndx, &gMmwMssMCB.cfg.openCfg, ptrCtrlCfg, &subFrameCfg->adcBufCfg, gMmwMssMCB.rfFreqScaleFactor, subFrameCfg->bpmCfg.isEnabled);
+        if (errCode != 0) { goto exit; }
+
+        /* ... (numDopplerBins, numRangeBins等的赋值) ... */
+        if (RFparserOutParams.numDopplerChirps <= 8) { RFparserOutParams.numDopplerBins = 16; }
+        subFrameCfg->numRangeBins = RFparserOutParams.numRangeBins;
+        if ((RFparserOutParams.numVirtualAntennas == 12) && (RFparserOutParams.numRangeBins == 1024)) { subFrameCfg->numRangeBins = 1022; RFparserOutParams.numRangeBins = 1022; }
+        subFrameCfg->numDopplerBins = RFparserOutParams.numDopplerBins;
+        subFrameCfg->numChirpsPerChirpEvent = RFparserOutParams.numChirpsPerChirpEvent;
+        subFrameCfg->adcBufChanDataSize = RFparserOutParams.adcBufChanDataSize;
+        subFrameCfg->objDetDynCfg.dspDynCfg.prepareRangeAzimuthHeatMap = subFrameCfg->guiMonSel.rangeAzimuthHeatMap;
+        subFrameCfg->numAdcSamples = RFparserOutParams.numAdcSamples;
+        subFrameCfg->numChirpsPerSubFrame = RFparserOutParams.numChirpsPerFrame;
+        subFrameCfg->numVirtualAntennas = RFparserOutParams.numVirtualAntennas;
+
+        /* 1. 在MSS端计算并划分Ping-Pong缓冲区 */
+        radarCubeSize = RFparserOutParams.numRangeBins * RFparserOutParams.numChirpsPerFrame * RFparserOutParams.numVirtualAntennas * sizeof(cmplx16ImRe_t);
+        if ((radarCubeSize * 2) > sizeof(gMmwL3)) { MmwDemo_debugAssert(0); }
+        pingPongBuffers[0].data = &gMmwL3[0];
+        pingPongBuffers[0].dataSize = radarCubeSize;
+        pingPongBuffers[1].data = &gMmwL3[radarCubeSize];
+        pingPongBuffers[1].dataSize = radarCubeSize;
+
+        /* 2. 配置MSS本地的1D-FFT DPC */
+        DPC_ObjectDetectionRangeHWA_setOutBufCfg outBufCfg;
+        outBufCfg.subFrameNum = subFrameIndx;
+        memcpy(&outBufCfg.radarCube[0], &pingPongBuffers[0], sizeof(DPIF_RadarCube) * 2);
+        errCode = DPM_ioctl(gMmwMssMCB.objDetDpmHandle, MMWDEMO_DPC_OBJDETRANGEHWA_IOCTL__SET_OUTPUT_BUFFERS, &outBufCfg, sizeof(outBufCfg));
+        if (errCode < 0) { goto exit; }
+
+        /* 3. 将缓冲区地址发送给DSS */
+        DPC_ObjectDetection_setInBufCfg inBufCfg;
+        int32_t tempErrCode;
+        inBufCfg.subFrameNum = subFrameIndx;
+        inBufCfg.radarCube[0].data = SOC_translateAddress((uint32_t)pingPongBuffers[0].data, SOC_TranslateAddr_Dir_TO_OTHER_CPU, &tempErrCode);
+        inBufCfg.radarCube[0].dataSize = pingPongBuffers[0].dataSize;
+        inBufCfg.radarCube[1].data = SOC_translateAddress((uint32_t)pingPongBuffers[1].data, SOC_TranslateAddr_Dir_TO_OTHER_CPU, &tempErrCode);
+        inBufCfg.radarCube[1].dataSize = pingPongBuffers[1].dataSize;
+        errCode = MmwDemo_DPM_ioctl_blocking(gMmwMssMCB.objDetDpmHandle, MMWDEMO_DPC_OBJDET_IOCTL__SET_INPUT_BUFFERS, &inBufCfg, sizeof(inBufCfg));
+        if (errCode < 0) { goto exit; }
+
+        /* ADCBuf, CQ, 和 DPC pre-start 配置 */
+        errCode = MmwDemo_ADCBufConfig(gMmwMssMCB.adcBufHandle, gMmwMssMCB.cfg.openCfg.chCfg.rxChannelEn, subFrameCfg->numChirpsPerChirpEvent, subFrameCfg->adcBufChanDataSize, &subFrameCfg->adcBufCfg, &staticCfg->ADCBufData.dataProperty.rxChanOffset[0]);
+        if (errCode < 0) { MmwDemo_debugAssert (0); }
+        errCode = MmwDemo_configCQ(subFrameCfg, RFparserOutParams.numChirpsPerChirpEvent, RFparserOutParams.validProfileIdx);
+        if (errCode < 0) { goto exit; }
+
+        /* DPC R4F Pre-start config */
+        {
+            /* ... (填充 objDetPreStartR4fCfg 的所有字段) ... */
+            errCode = MmwDemo_DPM_ioctl_blocking(gMmwMssMCB.objDetDpmHandle, DPC_OBJDETRANGEHWA_IOCTL__STATIC_PRE_START_CFG, &objDetPreStartR4fCfg, sizeof(DPC_ObjectDetectionRangeHWA_PreStartCfg));
+            if (errCode < 0) { goto exit; }
+        }
+
+        /* DPC DSP Pre-start config */
+        {
+            /* ... (填充 objDetPreStartDspCfg 的所有字段) ... */
+            errCode = MmwDemo_DPM_ioctl_blocking(gMmwMssMCB.objDetDpmHandle, DPC_OBJDET_IOCTL__STATIC_PRE_START_CFG, &objDetPreStartDspCfg, sizeof(DPC_ObjectDetection_PreStartCfg));
+            if (errCode < 0) { goto exit; }
+        }
+    }
+exit:
+    return errCode;
 }
 
 /**

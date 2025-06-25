@@ -84,13 +84,4 @@ typedef struct DPC_ObjectDetectionRangeHWA_setOutBufCfg_t
     DPIF_RadarCube  radarCube[2];
 } DPC_ObjectDetectionRangeHWA_setOutBufCfg;
 
-typedef struct MmwDemo_SubFrame_extCfg_t
-{
-    /*! @brief 由MSS主任务配置的、DSS可以使用的Ping-Pong输入缓冲区 */
-    DPIF_RadarCube  dssPingPongBuf[2];
-    /*! @brief 一个标志位，表示我们是否正在使用自定义的Ping-Pong缓冲区 */
-    bool            isCustomBufCfg;
-    /*! @brief 当前用于输出的Ping-Pong缓冲区的索引 (由1D DPC维护) */
-    uint8_t         pingPongId;
-} MmwDemo_SubFrame_extCfg;
 #endif
